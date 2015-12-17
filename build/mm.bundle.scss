@@ -33,6 +33,9 @@ $item-message-mine-bg: rgba(17, 193, 243, .1) !default;
 // Completion
 $completion-img-width: 24px !default;
 
+// Disabled items.
+$item-disabled-color: #999 !default;
+
 /**
  * Styles revert.
  */
@@ -122,6 +125,11 @@ em {
   }
 }
 
+// Defines a "disabled" item.
+.item.item-disabled {
+  color: $item-disabled-color;
+}
+
 // Split pane.
 .mm-split-pane {
   @include display-flex();
@@ -182,8 +190,8 @@ em {
  */
 .mm-iframe {
   position: relative;
-  height: 100%;
-  width: 100%;
+  max-height: 100%;
+  max-width: 100%;
   top: 0;
   bottom: 0;
   left: 0;
@@ -322,41 +330,16 @@ $bar-side-menu-text-color: $bar-content-text !default;
   top: $bar-side-menu-height;
 }
 
-$mma-messages-date-badge: "stable" !default;
-
-// The date displayed in the list.
-.mma-messages-date {
-
-  text-align: center;
-  margin-top: 10px;
-
-  span {
-    @extend .badge;
-    @extend .badge-#{$mma-messages-date-badge};
-  }
+input.mma-files-picker {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 100%;
+  min-height: 100%;
+  opacity: 0;
+  outline: none;
 }
 
-.mma-messages-input-inset {
-    padding-top: 0;
-    padding-left: 0;
-    padding-bottom: 0;
-}
-
-.mma-messages-footer-note {
-    color: $button-light-text;
-    font-size: $font-size-base;
-    text-align: center;
-    margin: 0;
-    width: 100%;
-}
-
-.button.mma-messages-clear-search {
-  top: 0px;
-}
-
-.mma-messages-discussion-container {
-  padding-bottom: 15px;
-}
 /* - User grades table (most of it extracted from MM1)
 -------------------------------------------------------------------------- */
 .mma-grades-table {
@@ -452,6 +435,41 @@ $mma-messages-date-badge: "stable" !default;
   }
 }
 
+$mma-messages-date-badge: "stable" !default;
+
+// The date displayed in the list.
+.mma-messages-date {
+
+  text-align: center;
+  margin-top: 10px;
+
+  span {
+    @extend .badge;
+    @extend .badge-#{$mma-messages-date-badge};
+  }
+}
+
+.mma-messages-input-inset {
+    padding-top: 0;
+    padding-left: 0;
+    padding-bottom: 0;
+}
+
+.mma-messages-footer-note {
+    color: $button-light-text;
+    font-size: $font-size-base;
+    text-align: center;
+    margin: 0;
+    width: 100%;
+}
+
+.button.mma-messages-clear-search {
+  top: 0px;
+}
+
+.mma-messages-discussion-container {
+  padding-bottom: 15px;
+}
 $mma-chat-notice-badge: "stable" !default;
 
 // The notice displayed in the list.
@@ -535,14 +553,64 @@ $mma-chat-notice-badge: "stable" !default;
     }
 }
 
-input.mma-files-picker {
-  position: absolute;
-  top: 0;
-  right: 0;
-  min-width: 100%;
-  min-height: 100%;
-  opacity: 0;
-  outline: none;
+
+$mma-mod-scorm-level-margin:		25px !default;
+$mma-mod-scorm-warning-color:		#c00 !default;
+
+@for $i from 0 through 15 {
+  .mma-scorm-level-#{$i} {
+    padding-left: $item-padding + 15px * $i
+  }
+}
+
+.mma-mod-scorm-checkbox-padding {
+  padding: 5px 10px;
+}
+
+.mma-mod-scorm-warning {
+  color: $mma-mod-scorm-warning-color;
+}
+
+.mma-mod-scorm-container {
+  display: flex;
+  flex-flow: column;
+  height: 100%;
+}
+
+.mma-mod-scorm-iframe-container {
+  flex: 1 1 auto;
+  position: relative;
+  .iframe-wrapper {
+    position: absolute;
+  }
+}
+
+ion-popover-view {
+  /* Adapt popover to content's height. The popover's ion-content needs to disable Ionic scroll. */
+  &.mma-scorm-popover {
+    height: auto;
+    max-height: 80%;
+    overflow: scroll;
+
+    ion-content {
+      position: relative;
+    }
+    &::-webkit-scrollbar {
+      display: none;
+    }
+  }
+
+  /* Decrease items padding in popover. */
+  .mma-scorm-popover-item {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}
+
+/* Fix popover styles in iOS. */
+.platform-ios ion-popover-view.mma-scorm-popover {
+  padding-top: 10px;
+  padding-bottom: 10px;
 }
 
 .mma-mod_survey-darkbg {

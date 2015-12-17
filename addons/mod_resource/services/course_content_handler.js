@@ -22,7 +22,7 @@ angular.module('mm.addons.mod_resource')
  * @name $mmaModResourceCourseContentHandler
  */
 .factory('$mmaModResourceCourseContentHandler', function($mmCourse, $mmaModResource, $mmEvents, $state, $mmSite, $mmUtil,
-            $mmCoursePrefetchDelegate, $mmFilepool, mmCoreDownloading, mmCoreNotDownloaded, mmCoreOutdated,
+            $mmCoursePrefetchDelegate, $mmFilepool, $mmFS, mmCoreDownloading, mmCoreNotDownloaded, mmCoreOutdated,
             mmCoreEventPackageStatusChanged, mmaModResourceComponent) {
 
     var self = {};
@@ -64,7 +64,9 @@ angular.module('mm.addons.mod_resource')
                     e.preventDefault();
                     e.stopPropagation();
                     $mmaModResource.prefetchContent(module).catch(function() {
-                        $mmUtil.showErrorModal('mm.core.errordownloading', true);
+                        if (!$scope.$$destroyed) {
+                            $mmUtil.showErrorModal('mm.core.errordownloading', true);
+                        }
                     });
                 }
             };
@@ -78,7 +80,9 @@ angular.module('mm.addons.mod_resource')
                     e.stopPropagation();
                     $mmaModResource.invalidateContent(module.id).finally(function() {
                         $mmaModResource.prefetchContent(module).catch(function() {
-                            $mmUtil.showErrorModal('mm.core.errordownloading', true);
+                            if (!$scope.$$destroyed) {
+                                $mmUtil.showErrorModal('mm.core.errordownloading', true);
+                            }
                         });
                     });
                 }
@@ -87,10 +91,10 @@ angular.module('mm.addons.mod_resource')
             $scope.title = module.name;
 
             var filename = module.contents[0].filename;
-            var extension = $mmUtil.getFileExtension(filename);
+            var extension = $mmFS.getFileExtension(filename);
 
             if (module.contents.length == 1 || (extension != "html" && extension != "htm")) {
-                $scope.icon = $mmUtil.getFileIcon(filename);
+                $scope.icon = $mmFS.getFileIcon(filename);
             } else {
                 $scope.icon = $mmCourse.getModuleIconSrc('resource');
             }
@@ -121,7 +125,7 @@ angular.module('mm.addons.mod_resource')
             });
 
             // Get current status to decide which icon should be shown.
-            $mmCoursePrefetchDelegate.getModuleStatus(module, revision, timemodified).then(showStatus);
+            $mmCoursePrefetchDelegate.getModuleStatus(module, courseid, revision, timemodified).then(showStatus);
 
             $scope.$on('$destroy', function() {
                 statusObserver && statusObserver.off && statusObserver.off();

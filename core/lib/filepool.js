@@ -182,7 +182,8 @@ angular.module('mm.core')
         ],
         revisionRegex = new RegExp('/content/([0-9]+)/'),
         queueDeferreds = {}, // To handle file downloads using the queue.
-        packagesPromises = {};
+        packagesPromises = {}, // To prevent downloading packages twice at the same time.
+        filePromises = {}; // To prevent downloading files twice at the same time.
 
     // Queue status codes.
     var QUEUE_RUNNING = 'mmFilepool:QUEUE_RUNNING',
@@ -606,10 +607,14 @@ angular.module('mm.core')
 
         // Set package as downloading.
         dwnPromise = self.storePackageStatus(siteId, component, componentId, mmCoreDownloading, revision, timemod).then(function() {
-            var promises = [];
+            var promises = [],
+                deferred = $q.defer(),
+                packageLoaded = 0; // Use a deferred to be able to use notify.
 
             angular.forEach(fileList, function(file) {
-                var path;
+                var path,
+                    promise,
+                    fileLoaded = 0;
 
                 if (dirPath) {
                     // Calculate the path to the file.
@@ -621,13 +626,27 @@ angular.module('mm.core')
                 }
 
                 if (prefetch) {
-                    promises.push(self.addToQueueByUrl(siteId, file.fileurl, component, componentId, file.timemodified, path));
+                    promise = self.addToQueueByUrl(siteId, file.fileurl, component, componentId, file.timemodified, path);
                 } else {
-                    promises.push(self.downloadUrl(siteId, file.fileurl, false, component, componentId, file.timemodified, path));
+                    promise = self.downloadUrl(siteId, file.fileurl, false, component, componentId, file.timemodified, path);
                 }
+
+                // Using undefined for success & fail will pass the success/failure to the parent promise.
+                promises.push(promise.then(undefined, undefined, function(progress) {
+                    if (progress && progress.loaded) {
+                        // Add the new size loaded to the package loaded.
+                        packageLoaded = packageLoaded + (progress.loaded - fileLoaded);
+                        fileLoaded = progress.loaded;
+                        deferred.notify({
+                            packageDownload: true,
+                            loaded: packageLoaded,
+                            fileProgress: progress
+                        });
+                    }
+                }));
             });
 
-            return $q.all(promises).then(function() {
+            $q.all(promises).then(function() {
                 // Success prefetching, store package as downloaded.
                 return self.storePackageStatus(siteId, component, componentId, mmCoreDownloaded, revision, timemod);
             }).catch(function() {
@@ -635,7 +654,9 @@ angular.module('mm.core')
                 return self.setPackagePreviousStatus(siteId, component, componentId).then(function() {
                     return $q.reject();
                 });
-            });
+            }).then(deferred.resolve, deferred.reject);
+
+            return deferred.promise;
         }).finally(function() {
             // Download finished, delete the promise.
             delete packagesPromises[siteId][packageId];
@@ -774,10 +795,21 @@ angular.module('mm.core')
             return $q.reject();
         }
 
-        return $mmSitesManager.getSite(siteId).then(function(site) {
+        var downloadId = self.getFileDownloadId(fileUrl, filePath),
+            deleted = false,
+            promise;
+
+        if (filePromises[siteId] && filePromises[siteId][downloadId]) {
+            // There's already a download ongoing for this file in this location, return the promise.
+            return filePromises[siteId][downloadId];
+        } else if (!filePromises[siteId]) {
+            filePromises[siteId] = {};
+        }
+
+        promise = $mmSitesManager.getSite(siteId).then(function(site) {
 
             if (!site.canDownloadFiles()) {
-                return $q.reject({drop: true});
+                return $q.reject();
             }
 
             return $mmWS.downloadFile(fileUrl, filePath).then(function(fileEntry) {
@@ -795,7 +827,16 @@ angular.module('mm.core')
                     return fileEntry.toURL();
                 });
             });
+        }).finally(function() {
+            // Download finished, delete the promise.
+            delete filePromises[siteId][downloadId];
+            deleted = true;
         });
+
+        if (!deleted) { // In case promise was finished immediately.
+            filePromises[siteId][downloadId] = promise;
+        }
+        return promise;
     };
 
     /**
@@ -831,6 +872,21 @@ angular.module('mm.core')
         return $mmSitesManager.getSite(siteId).then(function(site) {
             return site.fixPluginfileURL(fileUrl);
         });
+    };
+
+    /**
+     * Get the ID of a file download. Used to keep track of filePromises.
+     *
+     * @module mm.core
+     * @ngdoc method
+     * @name $mmFilepool#getFileDownloadId
+     * @param {String} fileUrl  The file URL.
+     * @param {String} filePath The file destination path.
+     * @return {String}         File download ID.
+     * @protected
+     */
+    self.getFileDownloadId = function(fileUrl, filePath) {
+        return md5.createHash(fileUrl + '###' + filePath);
     };
 
     /**
@@ -926,12 +982,12 @@ angular.module('mm.core')
      * @module mm.core
      * @ngdoc method
      * @name $mmFilepool#getPackageStatus
-     * @param {String} siteId           Site ID.
-     * @param {String} component        Package's component.
-     * @param {Number} [componentId]    An ID to use in conjunction with the component.
-     * @param {Number} [revision=0]     Package's revision.
-     * @param {Number} [timemodified=0] Package's timemodified.
-     * @return {Promise}                Promise resolved with the status.
+     * @param {String} siteId              Site ID.
+     * @param {String} component           Package's component.
+     * @param {Number} [componentId]       An ID to use in conjunction with the component.
+     * @param {Number|String} [revision=0] Package's revision.
+     * @param {Number} [timemodified=0]    Package's timemodified.
+     * @return {Promise}                   Promise resolved with the status.
      */
     self.getPackageStatus = function(siteId, component, componentId, revision, timemodified) {
         revision = revision || 0;
@@ -943,13 +999,23 @@ angular.module('mm.core')
             // Get status.
             return db.get(mmFilepoolPackagesStore, packageId).then(function(entry) {
                 if (entry.status === mmCoreDownloaded) {
-                    if (revision > entry.revision || timemodified > entry.timemodified) {
+                    if (revision != entry.revision || timemodified > entry.timemodified) {
                         // File is outdated. Let's change its status.
                         entry.status = mmCoreOutdated;
                         entry.updated = new Date().getTime();
                         db.insert(mmFilepoolPackagesStore, entry).then(function() {
                             // Success inserting, trigger event.
                             self._triggerPackageStatusChanged(siteId, component, componentId, mmCoreOutdated);
+                        });
+                    }
+                } else if (entry.status === mmCoreOutdated) {
+                    if (revision === entry.revision && timemodified === entry.timemodified) {
+                        // File isn't outdated anymore. Let's change its status.
+                        entry.status = mmCoreDownloaded;
+                        entry.updated = new Date().getTime();
+                        db.insert(mmFilepoolPackagesStore, entry).then(function() {
+                            // Success inserting, trigger event.
+                            self._triggerPackageStatusChanged(siteId, component, componentId, mmCoreDownloaded);
                         });
                     }
                 }
@@ -1289,7 +1355,7 @@ angular.module('mm.core')
             return $mmFS.getFile(self._getFilePath(siteId, fileId)).then(function(fileEntry) {
                 // We use toInternalURL so images are loaded in iOS8 using img HTML tags,
                 // with toURL the OS is unable to find the image files.
-                return fileEntry.toInternalURL();
+                return $mmFS.getInternalURL(fileEntry);
             });
         }
         return $q.reject();
@@ -1797,35 +1863,19 @@ angular.module('mm.core')
                         dropFromQueue = true;
 
                     } else if (errorObject.code === 3) { // CONNECTION_ERR.
-
-                        if (errorObject.http_status === 401) {
-                            // The URL is not in the white list.
-                            dropFromQueue = true;
-
-                        } else if (!errorObject.http_status) {
-                            // There was a connection issue, we are going to drop the file from the
-                            // queue because it's a strange error, we are supposed to be online but the
-                            // site is somehow not accessible.
-                            dropFromQueue = true;
-
-                        } else {
-                            // If there was an HTTP status, then let's remove from the queue.
-                            dropFromQueue = true;
-                        }
-
+                        // If there was an HTTP status, then let's remove from the queue.
+                        dropFromQueue = true;
                     } else if (errorObject.code === 4) { // ABORTED_ERR.
                         // The transfer was aborted, we will keep the file in queue.
-
                     } else if (errorObject.code === 5) { // NOT_MODIFIED_ERR.
                         // We have the latest version of the file, HTTP 304 status.
                         dropFromQueue = true;
-
                     } else {
                         // Unknown error, let's remove the file from the queue to avoid
                         // locking down the queue because of one file.
                         dropFromQueue = true;
                     }
-                } else if (typeof errorObject !== 'undefined' && errorObject.drop) {
+                } else {
                     dropFromQueue = true;
                 }
 
@@ -1847,6 +1897,11 @@ angular.module('mm.core')
                     return $q.reject();
                 }
 
+            }, function(progress) {
+                // Send the progress object to the queue deferred.
+                if (queueDeferreds[siteId] && queueDeferreds[siteId][fileId]) {
+                    queueDeferreds[siteId][fileId].notify(progress);
+                }
             });
         }
 
@@ -1917,6 +1972,23 @@ angular.module('mm.core')
             return $q.all(items.map(function(item) {
                 return self._removeFileById(siteId, item.fileId);
             }));
+        });
+    };
+
+    /**
+     * Remove a file from the pool.
+     *
+     * @module mm.core
+     * @ngdoc method
+     * @name $mmFilepool#removeFileByUrl
+     * @param {String} siteId  The site ID.
+     * @param {String} fileUrl The file URL.
+     * @return {Promise}       Resolved on success, rejected on failure. It is advised to silently ignore failures.
+     */
+    self.removeFileByUrl = function(siteId, fileUrl) {
+        return self._fixPluginfileURL(siteId, fileUrl).then(function(fileUrl) {
+            var fileId = self._getFileIdByUrl(fileUrl);
+            return self._removeFileById(siteId, fileId);
         });
     };
 
