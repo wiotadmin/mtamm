@@ -496,6 +496,18 @@ angular.module('mm.core')
                                 insert: function(store, value, id) {
                     return callDBFunction(db, 'put', store, value, id);
                 },
+                                insertSync: function(store, value) {
+                    if (db) {
+                        try {
+                            db.put(store, value);
+                            return true;
+                        } catch(ex) {
+                            $log.error('Error executing function sync put to DB '+db.getName());
+                            $log.error(ex.name+': '+ex.message);
+                        }
+                    }
+                    return false;
+                },
                                 query: function(store, where, order, reverse, limit) {
                     return doQuery(db, store, where, order, reverse, limit);
                 },
@@ -4281,6 +4293,13 @@ angular.module('mm.core')
         };
                 self.param = function(obj) {
             return provider.param(obj);
+        };
+                self.roundToDecimals = function(number, decimals) {
+            if (typeof decimals == 'undefined') {
+                decimals = 2;
+            }
+            var multiplier = Math.pow(10, decimals);
+            return Math.round(parseFloat(number) * multiplier) / multiplier;
         };
         return self;
     }];
@@ -8567,6 +8586,7 @@ angular.module('mm.addons.mod_scorm', ['mm.core'])
 .constant('mmaModScormEventLaunchNextSco', 'mma_mod_scorm_launch_next_sco')
 .constant('mmaModScormEventLaunchPrevSco', 'mma_mod_scorm_launch_prev_sco')
 .constant('mmaModScormEventUpdateToc', 'mma_mod_scorm_update_toc')
+.constant('mmaModScormEventGoOffline', 'mma_mod_scorm_go_offline')
 .config(["$stateProvider", function($stateProvider) {
     $stateProvider
     .state('site.mod_scorm', {
@@ -11303,6 +11323,304 @@ angular.module('mm.addons.mod_assign')
     return self;
 }]);
 
+angular.module('mm.addons.mod_chat')
+.controller('mmaModChatChatCtrl', ["$scope", "$stateParams", "$mmApp", "$mmaModChat", "$log", "$ionicModal", "$mmUtil", "$ionicHistory", "$ionicScrollDelegate", "$timeout", "$mmSite", "$interval", "mmaChatPollInterval", function($scope, $stateParams, $mmApp, $mmaModChat, $log, $ionicModal, $mmUtil, $ionicHistory,
+            $ionicScrollDelegate, $timeout, $mmSite, $interval, mmaChatPollInterval) {
+    $log = $log.getInstance('mmaModChatChatCtrl');
+    var chatId = $stateParams.chatid,
+        courseId = $stateParams.courseid,
+        title = $stateParams.title,
+        polling;
+    $scope.loaded = false;
+    $scope.title = title;
+    $scope.currentUserId = $mmSite.getUserId();
+    $scope.currentUserBeep = 'beep ' + $scope.currentUserId;
+    $scope.messages = [];
+    $scope.chatUsers = [];
+    $scope.newMessage = {
+        text: ''
+    };
+    chatLastTime = 0;
+    $ionicModal.fromTemplateUrl('addons/mod_chat/templates/users.html', {
+        scope: $scope,
+        animation: 'slide-in-up'
+    }).then(function(m) {
+        $scope.modal = m;
+    });
+    $scope.closeModal = function(){
+        $scope.modal.hide();
+    };
+    $scope.showChatUsers = function() {
+        $scope.usersLoaded = false;
+        $scope.modal.show();
+        $mmaModChat.getChatUsers($scope.chatsid).then(function(data) {
+            $scope.chatUsers = data.users;
+        }).catch(function(error) {
+            showError(error, 'mma.mod_chat.errorwhilegettingchatusers');
+        }).finally(function() {
+            $scope.usersLoaded = true;
+        });
+    };
+    $scope.talkTo = function(user) {
+        $scope.newMessage.text = "To " + user + ": ";
+        $scope.modal.hide();
+    };
+    $scope.beepTo = function(userId) {
+        $scope.sendMessage('', userId);
+        $scope.modal.hide();
+    };
+    $scope.isAppOffline = function() {
+        return !$mmApp.isOnline();
+    };
+    function showError(error, defaultMessage) {
+        if (typeof error === 'string') {
+            $mmUtil.showErrorModal(error);
+        } else {
+            $mmUtil.showErrorModal(defaultMessage, true);
+        }
+    }
+    $scope.showDate = function(message, prevMessage) {
+        if (!prevMessage) {
+            return true;
+        }
+        return !moment(message.timestamp * 1000).isSame(prevMessage.timestamp * 1000, 'day');
+    };
+    $scope.sendMessage = function(text, beep) {
+        beep = beep || '';
+        if (!$mmApp.isOnline()) {
+            return;
+        } else if (beep === '' && !text.trim()) {
+            return;
+        }
+        text = text.replace(/(?:\r\n|\r|\n)/g, '<br />');
+        $mmaModChat.sendMessage($scope.chatsid, text, beep).then(function() {
+            if (beep === '') {
+                $scope.newMessage.text = '';
+            }
+        }, function(error) {
+            $mmApp.closeKeyboard();
+            showError(error, 'mma.mod_chat.errorwhilesendingmessage');
+        });
+    };
+    $mmaModChat.loginUser(chatId).then(function(chatsid) {
+        return $mmaModChat.getLatestMessages(chatsid, 0).then(function(messagesInfo) {
+            $scope.chatsid = chatsid;
+            chatLastTime = messagesInfo.chatnewlasttime;
+            return $mmaModChat.getMessagesUserData(messagesInfo.messages, courseId).then(function(messages) {
+                $scope.messages = $scope.messages.concat(messages);
+            });
+        }).catch(function(message) {
+            showError(message, 'mma.mod_chat.errorwhileretrievingmessages');
+        });
+    }, function(error) {
+        showError(error, 'mma.mod_chat.errorwhileconnecting');
+        $ionicHistory.goBack();
+    }).finally(function() {
+        $scope.loaded = true;
+    });
+    $scope.scrollAfterRender = function(scope) {
+        if (scope.$last === true) {
+            $timeout(function() {
+                var scrollView = $ionicScrollDelegate.$getByHandle('mmaChatScroll');
+                scrollView.scrollBottom();
+            });
+        }
+    };
+    $scope.$on('$ionicView.enter', function() {
+        if (polling) {
+            return;
+        }
+        polling = $interval(function() {
+            $log.debug('Polling for messages');
+            if (!$mmApp.isOnline()) {
+                return;
+            }
+            $mmaModChat.getLatestMessages($scope.chatsid, chatLastTime).then(function(data) {
+                chatLastTime = data.chatnewlasttime;
+                $mmaModChat.getMessagesUserData(data.messages, courseId).then(function(messages) {
+                    $scope.messages = $scope.messages.concat(messages);
+                });
+            }, function(error) {
+                $interval.cancel(polling);
+                showError(error, 'mma.mod_chat.errorwhileretrievingmessages');
+            });
+        }, mmaChatPollInterval);
+    });
+    $scope.$on('$ionicView.leave', function(e) {
+        if (polling) {
+            $log.debug('Cancelling polling for conversation');
+            $interval.cancel(polling);
+        }
+    });
+}]);
+
+angular.module('mm.addons.mod_chat')
+.controller('mmaModChatIndexCtrl', ["$scope", "$stateParams", "$mmaModChat", "$mmUtil", "$q", "$mmCourse", function($scope, $stateParams, $mmaModChat, $mmUtil, $q, $mmCourse) {
+    var module = $stateParams.module || {},
+        courseid = $stateParams.courseid,
+        chat;
+    $scope.title = module.name;
+    $scope.description = module.description;
+    $scope.moduleurl = module.url;
+    $scope.courseid = courseid;
+    function fetchChatData(refresh) {
+        return $mmaModChat.getChat(courseid, module.id, refresh).then(function(chatdata) {
+            chat = chatdata;
+            $scope.title = chat.name || $scope.title;
+            $scope.description = chat.intro || $scope.description;
+            $scope.chatId = chat.id;
+            $scope.chatScheduled = '';
+            var now = $mmUtil.timestamp();
+            var span = chat.chattime - now;
+            if (chat.chattime && chat.schedule > 0 && span > 0) {
+                $mmUtil.formatTime(span).then(function(time) {
+                    $scope.chatScheduled = time;
+                });
+            }
+        }, function(error) {
+            if (!refresh) {
+                return fetchChatData(true);
+            }
+            if (error) {
+                $mmUtil.showErrorModal(error);
+            } else {
+                $mmUtil.showErrorModal('mma.mod_chat.errorwhilegettingchatdata', true);
+            }
+            return $q.reject();
+        });
+    }
+    fetchChatData().then(function() {
+        $mmaModChat.logView(chat.id).then(function() {
+            $mmCourse.checkModuleCompletion(courseid, module.completionstatus);
+        });
+    }).finally(function() {
+        $scope.chatLoaded = true;
+    });
+    $scope.refreshChat = function() {
+        fetchChatData(true).finally(function() {
+            $scope.$broadcast('scroll.refreshComplete');
+        });
+    };
+}]);
+angular.module('mm.addons.mod_chat')
+.factory('$mmaModChat', ["$q", "$mmSite", "$mmUser", function($q, $mmSite, $mmUser) {
+    var self = {};
+        self.isPluginEnabled = function() {
+        return  $mmSite.wsAvailable('mod_chat_get_chats_by_courses') &&
+                $mmSite.wsAvailable('mod_chat_login_user') &&
+                $mmSite.wsAvailable('mod_chat_get_chat_users') &&
+                $mmSite.wsAvailable('mod_chat_send_chat_message') &&
+                $mmSite.wsAvailable('mod_chat_get_chat_latest_messages');
+    };
+        self.getChat = function(courseid, cmid, refresh) {
+        var params = {
+            courseids: [courseid]
+            },
+            preSets = {};
+        if (refresh) {
+            preSets.getFromCache = false;
+        }
+        return $mmSite.read('mod_chat_get_chats_by_courses', params, preSets).then(function(response) {
+            if (response.chats) {
+                var currentChat;
+                angular.forEach(response.chats, function(chat) {
+                    if (chat.coursemodule == cmid) {
+                        currentChat = chat;
+                    }
+                });
+                if (currentChat) {
+                    return currentChat;
+                }
+            }
+            return $q.reject();
+        });
+    };
+        self.loginUser = function(chatId) {
+        var params = {
+            chatid: chatId
+        };
+        return $mmSite.write('mod_chat_login_user', params).then(function(response) {
+            if (response.chatsid) {
+                return response.chatsid;
+            }
+            return $q.reject();
+        });
+    };
+        self.logView = function(id) {
+        if (id) {
+            var params = {
+                chatid: id
+            };
+            return $mmSite.write('mod_chat_view_chat', params);
+        }
+        return $q.reject();
+    };
+        self.sendMessage = function(chatsid, message, beep) {
+        var params = {
+            chatsid: chatsid,
+            messagetext: message,
+            beepid: beep
+        };
+        return $mmSite.write('mod_chat_send_chat_message', params).then(function(response) {
+            if (response.messageid) {
+                return response.messageid;
+            }
+            return $q.reject();
+        });
+    };
+        self.getLatestMessages = function(chatsid, lasttime) {
+        var params = {
+            chatsid: chatsid,
+            chatlasttime: lasttime
+        };
+        var preSets = {
+            getFromCache: false
+        };
+        return $mmSite.read('mod_chat_get_chat_latest_messages', params, preSets);
+    };
+        self.getMessagesUserData = function(messages, courseid) {
+        var promises = [];
+        angular.forEach(messages, function(message) {
+            var promise = $mmUser.getProfile(message.userid, courseid, true).then(function(user) {
+                message.userfullname = user.fullname;
+                message.userprofileimageurl = user.profileimageurl;
+            }, function() {
+                message.userfullname = message.userid;
+            });
+            promises.push(promise);
+        });
+        return $q.all(promises).then(function() {
+            return messages;
+        });
+    };
+        self.getChatUsers = function(chatsid) {
+        var params = {
+            chatsid: chatsid
+        };
+        var preSets = {
+            getFromCache: false
+        };
+        return $mmSite.read('mod_chat_get_chat_users', params, preSets);
+    };
+    return self;
+}]);
+angular.module('mm.addons.mod_chat')
+.factory('$mmaModChatCourseContentHandler', ["$mmCourse", "$mmaModChat", "$state", function($mmCourse, $mmaModChat, $state) {
+    var self = {};
+        self.isEnabled = function() {
+        return $mmaModChat.isPluginEnabled();
+    };
+        self.getController = function(module, courseid) {
+        return function($scope) {
+            $scope.title = module.name;
+            $scope.icon = $mmCourse.getModuleIconSrc('chat');
+            $scope.action = function(e) {
+                $state.go('site.mod_chat', {module: module, courseid: courseid});
+            };
+        };
+    };
+    return self;
+}]);
 angular.module('mm.addons.mod_book')
 .controller('mmaModBookIndexCtrl', ["$scope", "$stateParams", "$mmUtil", "$mmaModBook", "$log", "mmaModBookComponent", "$ionicPopover", "$mmApp", "$q", "$mmCourse", "$ionicScrollDelegate", function($scope, $stateParams, $mmUtil, $mmaModBook, $log, mmaModBookComponent,
             $ionicPopover, $mmApp, $q, $mmCourse, $ionicScrollDelegate) {
@@ -11663,304 +11981,6 @@ angular.module('mm.addons.mod_book')
     return self;
 }]);
 
-angular.module('mm.addons.mod_chat')
-.controller('mmaModChatChatCtrl', ["$scope", "$stateParams", "$mmApp", "$mmaModChat", "$log", "$ionicModal", "$mmUtil", "$ionicHistory", "$ionicScrollDelegate", "$timeout", "$mmSite", "$interval", "mmaChatPollInterval", function($scope, $stateParams, $mmApp, $mmaModChat, $log, $ionicModal, $mmUtil, $ionicHistory,
-            $ionicScrollDelegate, $timeout, $mmSite, $interval, mmaChatPollInterval) {
-    $log = $log.getInstance('mmaModChatChatCtrl');
-    var chatId = $stateParams.chatid,
-        courseId = $stateParams.courseid,
-        title = $stateParams.title,
-        polling;
-    $scope.loaded = false;
-    $scope.title = title;
-    $scope.currentUserId = $mmSite.getUserId();
-    $scope.currentUserBeep = 'beep ' + $scope.currentUserId;
-    $scope.messages = [];
-    $scope.chatUsers = [];
-    $scope.newMessage = {
-        text: ''
-    };
-    chatLastTime = 0;
-    $ionicModal.fromTemplateUrl('addons/mod_chat/templates/users.html', {
-        scope: $scope,
-        animation: 'slide-in-up'
-    }).then(function(m) {
-        $scope.modal = m;
-    });
-    $scope.closeModal = function(){
-        $scope.modal.hide();
-    };
-    $scope.showChatUsers = function() {
-        $scope.usersLoaded = false;
-        $scope.modal.show();
-        $mmaModChat.getChatUsers($scope.chatsid).then(function(data) {
-            $scope.chatUsers = data.users;
-        }).catch(function(error) {
-            showError(error, 'mma.mod_chat.errorwhilegettingchatusers');
-        }).finally(function() {
-            $scope.usersLoaded = true;
-        });
-    };
-    $scope.talkTo = function(user) {
-        $scope.newMessage.text = "To " + user + ": ";
-        $scope.modal.hide();
-    };
-    $scope.beepTo = function(userId) {
-        $scope.sendMessage('', userId);
-        $scope.modal.hide();
-    };
-    $scope.isAppOffline = function() {
-        return !$mmApp.isOnline();
-    };
-    function showError(error, defaultMessage) {
-        if (typeof error === 'string') {
-            $mmUtil.showErrorModal(error);
-        } else {
-            $mmUtil.showErrorModal(defaultMessage, true);
-        }
-    }
-    $scope.showDate = function(message, prevMessage) {
-        if (!prevMessage) {
-            return true;
-        }
-        return !moment(message.timestamp * 1000).isSame(prevMessage.timestamp * 1000, 'day');
-    };
-    $scope.sendMessage = function(text, beep) {
-        beep = beep || '';
-        if (!$mmApp.isOnline()) {
-            return;
-        } else if (beep === '' && !text.trim()) {
-            return;
-        }
-        text = text.replace(/(?:\r\n|\r|\n)/g, '<br />');
-        $mmaModChat.sendMessage($scope.chatsid, text, beep).then(function() {
-            if (beep === '') {
-                $scope.newMessage.text = '';
-            }
-        }, function(error) {
-            $mmApp.closeKeyboard();
-            showError(error, 'mma.mod_chat.errorwhilesendingmessage');
-        });
-    };
-    $mmaModChat.loginUser(chatId).then(function(chatsid) {
-        return $mmaModChat.getLatestMessages(chatsid, 0).then(function(messagesInfo) {
-            $scope.chatsid = chatsid;
-            chatLastTime = messagesInfo.chatnewlasttime;
-            return $mmaModChat.getMessagesUserData(messagesInfo.messages, courseId).then(function(messages) {
-                $scope.messages = $scope.messages.concat(messages);
-            });
-        }).catch(function(message) {
-            showError(message, 'mma.mod_chat.errorwhileretrievingmessages');
-        });
-    }, function(error) {
-        showError(error, 'mma.mod_chat.errorwhileconnecting');
-        $ionicHistory.goBack();
-    }).finally(function() {
-        $scope.loaded = true;
-    });
-    $scope.scrollAfterRender = function(scope) {
-        if (scope.$last === true) {
-            $timeout(function() {
-                var scrollView = $ionicScrollDelegate.$getByHandle('mmaChatScroll');
-                scrollView.scrollBottom();
-            });
-        }
-    };
-    $scope.$on('$ionicView.enter', function() {
-        if (polling) {
-            return;
-        }
-        polling = $interval(function() {
-            $log.debug('Polling for messages');
-            if (!$mmApp.isOnline()) {
-                return;
-            }
-            $mmaModChat.getLatestMessages($scope.chatsid, chatLastTime).then(function(data) {
-                chatLastTime = data.chatnewlasttime;
-                $mmaModChat.getMessagesUserData(data.messages, courseId).then(function(messages) {
-                    $scope.messages = $scope.messages.concat(messages);
-                });
-            }, function(error) {
-                $interval.cancel(polling);
-                showError(error, 'mma.mod_chat.errorwhileretrievingmessages');
-            });
-        }, mmaChatPollInterval);
-    });
-    $scope.$on('$ionicView.leave', function(e) {
-        if (polling) {
-            $log.debug('Cancelling polling for conversation');
-            $interval.cancel(polling);
-        }
-    });
-}]);
-
-angular.module('mm.addons.mod_chat')
-.controller('mmaModChatIndexCtrl', ["$scope", "$stateParams", "$mmaModChat", "$mmUtil", "$q", "$mmCourse", function($scope, $stateParams, $mmaModChat, $mmUtil, $q, $mmCourse) {
-    var module = $stateParams.module || {},
-        courseid = $stateParams.courseid,
-        chat;
-    $scope.title = module.name;
-    $scope.description = module.description;
-    $scope.moduleurl = module.url;
-    $scope.courseid = courseid;
-    function fetchChatData(refresh) {
-        return $mmaModChat.getChat(courseid, module.id, refresh).then(function(chatdata) {
-            chat = chatdata;
-            $scope.title = chat.name || $scope.title;
-            $scope.description = chat.intro || $scope.description;
-            $scope.chatId = chat.id;
-            $scope.chatScheduled = '';
-            var now = $mmUtil.timestamp();
-            var span = chat.chattime - now;
-            if (chat.chattime && chat.schedule > 0 && span > 0) {
-                $mmUtil.formatTime(span).then(function(time) {
-                    $scope.chatScheduled = time;
-                });
-            }
-        }, function(error) {
-            if (!refresh) {
-                return fetchChatData(true);
-            }
-            if (error) {
-                $mmUtil.showErrorModal(error);
-            } else {
-                $mmUtil.showErrorModal('mma.mod_chat.errorwhilegettingchatdata', true);
-            }
-            return $q.reject();
-        });
-    }
-    fetchChatData().then(function() {
-        $mmaModChat.logView(chat.id).then(function() {
-            $mmCourse.checkModuleCompletion(courseid, module.completionstatus);
-        });
-    }).finally(function() {
-        $scope.chatLoaded = true;
-    });
-    $scope.refreshChat = function() {
-        fetchChatData(true).finally(function() {
-            $scope.$broadcast('scroll.refreshComplete');
-        });
-    };
-}]);
-angular.module('mm.addons.mod_chat')
-.factory('$mmaModChat', ["$q", "$mmSite", "$mmUser", function($q, $mmSite, $mmUser) {
-    var self = {};
-        self.isPluginEnabled = function() {
-        return  $mmSite.wsAvailable('mod_chat_get_chats_by_courses') &&
-                $mmSite.wsAvailable('mod_chat_login_user') &&
-                $mmSite.wsAvailable('mod_chat_get_chat_users') &&
-                $mmSite.wsAvailable('mod_chat_send_chat_message') &&
-                $mmSite.wsAvailable('mod_chat_get_chat_latest_messages');
-    };
-        self.getChat = function(courseid, cmid, refresh) {
-        var params = {
-            courseids: [courseid]
-            },
-            preSets = {};
-        if (refresh) {
-            preSets.getFromCache = false;
-        }
-        return $mmSite.read('mod_chat_get_chats_by_courses', params, preSets).then(function(response) {
-            if (response.chats) {
-                var currentChat;
-                angular.forEach(response.chats, function(chat) {
-                    if (chat.coursemodule == cmid) {
-                        currentChat = chat;
-                    }
-                });
-                if (currentChat) {
-                    return currentChat;
-                }
-            }
-            return $q.reject();
-        });
-    };
-        self.loginUser = function(chatId) {
-        var params = {
-            chatid: chatId
-        };
-        return $mmSite.write('mod_chat_login_user', params).then(function(response) {
-            if (response.chatsid) {
-                return response.chatsid;
-            }
-            return $q.reject();
-        });
-    };
-        self.logView = function(id) {
-        if (id) {
-            var params = {
-                chatid: id
-            };
-            return $mmSite.write('mod_chat_view_chat', params);
-        }
-        return $q.reject();
-    };
-        self.sendMessage = function(chatsid, message, beep) {
-        var params = {
-            chatsid: chatsid,
-            messagetext: message,
-            beepid: beep
-        };
-        return $mmSite.write('mod_chat_send_chat_message', params).then(function(response) {
-            if (response.messageid) {
-                return response.messageid;
-            }
-            return $q.reject();
-        });
-    };
-        self.getLatestMessages = function(chatsid, lasttime) {
-        var params = {
-            chatsid: chatsid,
-            chatlasttime: lasttime
-        };
-        var preSets = {
-            getFromCache: false
-        };
-        return $mmSite.read('mod_chat_get_chat_latest_messages', params, preSets);
-    };
-        self.getMessagesUserData = function(messages, courseid) {
-        var promises = [];
-        angular.forEach(messages, function(message) {
-            var promise = $mmUser.getProfile(message.userid, courseid, true).then(function(user) {
-                message.userfullname = user.fullname;
-                message.userprofileimageurl = user.profileimageurl;
-            }, function() {
-                message.userfullname = message.userid;
-            });
-            promises.push(promise);
-        });
-        return $q.all(promises).then(function() {
-            return messages;
-        });
-    };
-        self.getChatUsers = function(chatsid) {
-        var params = {
-            chatsid: chatsid
-        };
-        var preSets = {
-            getFromCache: false
-        };
-        return $mmSite.read('mod_chat_get_chat_users', params, preSets);
-    };
-    return self;
-}]);
-angular.module('mm.addons.mod_chat')
-.factory('$mmaModChatCourseContentHandler', ["$mmCourse", "$mmaModChat", "$state", function($mmCourse, $mmaModChat, $state) {
-    var self = {};
-        self.isEnabled = function() {
-        return $mmaModChat.isPluginEnabled();
-    };
-        self.getController = function(module, courseid) {
-        return function($scope) {
-            $scope.title = module.name;
-            $scope.icon = $mmCourse.getModuleIconSrc('chat');
-            $scope.action = function(e) {
-                $state.go('site.mod_chat', {module: module, courseid: courseid});
-            };
-        };
-    };
-    return self;
-}]);
 angular.module('mm.addons.mod_choice')
 .controller('mmaModChoiceIndexCtrl', ["$scope", "$stateParams", "$mmaModChoice", "$mmUtil", "$q", "$mmCourse", "$translate", function($scope, $stateParams, $mmaModChoice, $mmUtil, $q, $mmCourse, $translate) {
     var module = $stateParams.module || {},
@@ -14381,14 +14401,18 @@ angular.module('mm.addons.mod_resource')
 }]);
 
 angular.module('mm.addons.mod_scorm')
-.controller('mmaModScormIndexCtrl', ["$scope", "$stateParams", "$mmaModScorm", "$mmUtil", "$q", "$mmCourse", "$ionicScrollDelegate", "$mmCoursePrefetchDelegate", "$mmaModScormHelper", "$mmEvents", "$mmSite", "$state", "mmCoreOutdated", "mmCoreNotDownloaded", "mmCoreDownloading", "mmaModScormComponent", "mmCoreEventPackageStatusChanged", function($scope, $stateParams, $mmaModScorm, $mmUtil, $q, $mmCourse, $ionicScrollDelegate,
+.controller('mmaModScormIndexCtrl', ["$scope", "$stateParams", "$mmaModScorm", "$mmUtil", "$q", "$mmCourse", "$ionicScrollDelegate", "$mmCoursePrefetchDelegate", "$mmaModScormHelper", "$mmEvents", "$mmSite", "$state", "mmCoreOutdated", "mmCoreNotDownloaded", "mmCoreDownloading", "mmaModScormComponent", "mmCoreEventPackageStatusChanged", "$ionicHistory", "$ionicScrollDelegate", function($scope, $stateParams, $mmaModScorm, $mmUtil, $q, $mmCourse, $ionicScrollDelegate,
             $mmCoursePrefetchDelegate, $mmaModScormHelper, $mmEvents, $mmSite, $state, mmCoreOutdated, mmCoreNotDownloaded,
-            mmCoreDownloading, mmaModScormComponent, mmCoreEventPackageStatusChanged) {
+            mmCoreDownloading, mmaModScormComponent, mmCoreEventPackageStatusChanged, $ionicHistory, $ionicScrollDelegate) {
     var module = $stateParams.module || {},
         courseid = $stateParams.courseid,
         scorm,
         statusObserver,
-        currentStatus;
+        currentStatus,
+        lastAttempt,
+        lastOffline = false,
+        attempts,
+        scrollView = $ionicScrollDelegate.$getByHandle('mmaModScormIndexScroll');
     $scope.title = module.name;
     $scope.description = module.description;
     $scope.moduleUrl = module.url;
@@ -14398,9 +14422,6 @@ angular.module('mm.addons.mod_scorm')
     };
     $scope.modenormal = $mmaModScorm.MODENORMAL;
     $scope.modebrowse = $mmaModScorm.MODEBROWSE;
-    $scope.filterAttempts = function(attempt) {
-        return attempt && typeof attempt.grade != 'undefined';
-    };
     function fetchScormData(refresh) {
         return $mmaModScorm.getScorm(courseid, module.id, module.url).then(function(scormData) {
             scorm = scormData;
@@ -14416,19 +14437,20 @@ angular.module('mm.addons.mod_scorm')
             if (scorm.warningmessage) {
                 return;
             }
-            return $mmaModScorm.getAttemptCount(scorm.id).then(function(numAttempts) {
-                return $mmaModScorm.isAttemptIncomplete(scorm, numAttempts).then(function(incomplete) {
+            return $mmaModScorm.getAttemptCount(scorm.id).then(function(attemptsData) {
+                attempts = attemptsData;
+                lastAttempt = attempts.lastAttempt.number;
+                lastOffline = attempts.lastAttempt.offline;
+                return $mmaModScorm.isAttemptIncomplete(scorm, lastAttempt, lastOffline).then(function(incomplete) {
                     var promises = [];
                     scorm.incomplete = incomplete;
-                    scorm.numAttempts = numAttempts;
+                    scorm.numAttempts = attempts.total;
                     scorm.grademethodReadable = $mmaModScorm.getScormGradeMethod(scorm);
-                    scorm.attemptsLeft = $mmaModScorm.countAttemptsLeft(scorm, numAttempts);
+                    scorm.attemptsLeft = $mmaModScorm.countAttemptsLeft(scorm, lastAttempt);
                     if (scorm.forceattempt && scorm.incomplete) {
                         $scope.scormOptions.newAttempt = true;
                     }
-                    if (scorm.displayattemptstatus) {
-                        promises.push(getReportedGrades());
-                    }
+                    promises.push(getReportedGrades());
                     promises.push(fetchStructure());
                     if (!scorm.packagesize && $scope.errorMessage === '') {
                         promises.push($mmaModScorm.calculateScormSize(scorm).then(function(size) {
@@ -14458,27 +14480,39 @@ angular.module('mm.addons.mod_scorm')
         return $q.reject();
     }
     function getReportedGrades() {
-        return $mmaModScorm.getAttemptCount(scorm.id, undefined, true).then(function(numAttempts) {
-            var promises = [];
-            scorm.attempts = [];
-            for (var attempt = 1; attempt <= numAttempts; attempt++) {
+        var promises = [];
+        scorm.onlineAttempts = {};
+        scorm.offlineAttempts = {};
+        attempts.online.forEach(function(attempt) {
+            if (attempts.offline.indexOf(attempt) == -1) {
                 promises.push(getAttemptGrade(scorm, attempt));
             }
-            return $q.all(promises).then(function() {
-                scorm.grade = $mmaModScorm.calculateScormGrade(scorm, scorm.attempts);
-                angular.forEach(scorm.attempts, function(attempt) {
-                    attempt.grade = $mmaModScorm.formatGrade(scorm, attempt.grade);
-                });
-                scorm.grade = $mmaModScorm.formatGrade(scorm, scorm.grade);
+        });
+        attempts.offline.forEach(function(attempt) {
+            promises.push(getAttemptGrade(scorm, attempt, true));
+        });
+        return $q.all(promises).then(function() {
+            scorm.grade = $mmaModScorm.calculateScormGrade(scorm, scorm.onlineAttempts);
+            angular.forEach(scorm.onlineAttempts, function(attempt) {
+                attempt.grade = $mmaModScorm.formatGrade(scorm, attempt.grade);
             });
+            angular.forEach(scorm.offlineAttempts, function(attempt) {
+                attempt.grade = $mmaModScorm.formatGrade(scorm, attempt.grade);
+            });
+            scorm.grade = $mmaModScorm.formatGrade(scorm, scorm.grade);
         });
     }
-    function getAttemptGrade(scorm, attempt) {
-        return $mmaModScorm.getAttemptGrade(scorm, attempt).then(function(grade) {
-            scorm.attempts[attempt - 1] = {
+    function getAttemptGrade(scorm, attempt, offline) {
+        return $mmaModScorm.getAttemptGrade(scorm, attempt, offline).then(function(grade) {
+            var entry = {
                 number: attempt,
                 grade: grade
             };
+            if (offline) {
+                scorm.offlineAttempts[attempt] = entry;
+            } else {
+                scorm.onlineAttempts[attempt] = entry;
+            }
         });
     }
     function fetchStructure() {
@@ -14499,7 +14533,7 @@ angular.module('mm.addons.mod_scorm')
             return $q.when();
         }
         $scope.loadingToc = true;
-        return $mmaModScorm.getOrganizationToc(scorm.id, organizationId, scorm.numAttempts).then(function(toc) {
+        return $mmaModScorm.getOrganizationToc(scorm.id, organizationId, lastAttempt, lastOffline).then(function(toc) {
             $scope.toc = $mmaModScorm.formatTocToArray(toc);
             angular.forEach($scope.toc, function(sco) {
                 sco.image = $mmaModScorm.getScoStatusIcon(sco, scorm.incomplete);
@@ -14626,15 +14660,25 @@ angular.module('mm.addons.mod_scorm')
             openScorm(scoId);
         }
     };
+    $scope.$on('$ionicView.enter', function() {
+        var forwardView = $ionicHistory.forwardView();
+        if (forwardView && forwardView.stateName === 'site.mod_scorm-player') {
+            $scope.scormLoaded = false;
+            scrollView.scrollTop();
+            refreshData().finally(function() {
+                $scope.scormLoaded = true;
+            });
+        }
+    });
     $scope.$on('$destroy', function() {
         statusObserver && statusObserver.off && statusObserver.off();
     });
 }]);
 
 angular.module('mm.addons.mod_scorm')
-.controller('mmaModScormPlayerCtrl', ["$scope", "$stateParams", "$mmaModScorm", "$mmUtil", "$ionicPopover", "$mmaModScormHelper", "$mmEvents", "$timeout", "$q", "mmaModScormEventUpdateToc", "mmaModScormEventLaunchNextSco", "mmaModScormEventLaunchPrevSco", "$mmaModScormDataModel12", function($scope, $stateParams, $mmaModScorm, $mmUtil, $ionicPopover, $mmaModScormHelper,
+.controller('mmaModScormPlayerCtrl', ["$scope", "$stateParams", "$mmaModScorm", "$mmUtil", "$ionicPopover", "$mmaModScormHelper", "$mmEvents", "$timeout", "$q", "mmaModScormEventUpdateToc", "mmaModScormEventLaunchNextSco", "mmaModScormEventLaunchPrevSco", "$mmaModScormDataModel12", "mmaModScormEventGoOffline", function($scope, $stateParams, $mmaModScorm, $mmUtil, $ionicPopover, $mmaModScormHelper,
             $mmEvents, $timeout, $q, mmaModScormEventUpdateToc, mmaModScormEventLaunchNextSco, mmaModScormEventLaunchPrevSco,
-            $mmaModScormDataModel12) {
+            $mmaModScormDataModel12, mmaModScormEventGoOffline) {
     var scorm = $stateParams.scorm || {},
         mode = $stateParams.mode || $mmaModScorm.MODENORMAL,
         newAttempt = $stateParams.newAttempt,
@@ -14642,35 +14686,55 @@ angular.module('mm.addons.mod_scorm')
         currentSco,
         attempt,
         userData,
-        apiInitialized = false;
+        apiInitialized = false,
+        offline = false;
     $scope.title = scorm.name;
     $scope.description = scorm.intro;
     $scope.scorm = scorm;
     $scope.loadingToc = true;
     function fetchData() {
-        return $mmaModScorm.getAttemptCount(scorm.id).then(function(numAttempts) {
-            attempt = numAttempts;
-            var promise;
-            if (numAttempts > 0) {
-                promise = $mmaModScorm.isAttemptIncomplete(scorm, attempt);
+        return $mmaModScorm.getAttemptCount(scorm.id).then(function(attemptsData) {
+            return determineAttemptAndMode(attemptsData).then(function() {
+                var promises = [];
+                promises.push(fetchToc());
+                promises.push($mmaModScorm.getScormUserData(scorm.id, attempt, offline).then(function(data) {
+                    userData = data;
+                }));
+                return $q.all(promises);
+            });
+        }).catch(showError);
+    }
+    function determineAttemptAndMode(attemptsData) {
+        attempt = attemptsData.lastAttempt.number;
+        offline = attemptsData.lastAttempt.offline;
+        var promise;
+        if (attempt > 0) {
+            promise = $mmaModScorm.isAttemptIncomplete(scorm, attempt, offline);
+        } else {
+            promise = $q.when(false);
+        }
+        return promise.then(function(incomplete) {
+            var result = $mmaModScorm.determineAttemptAndMode(scorm, mode, attempt, newAttempt, incomplete);
+            if (result.attempt > attempt) {
+                if (offline) {
+                    promise = $mmaModScormHelper.createOfflineAttempt(scorm, result.attempt, attemptsData.online.length);
+                } else {
+                    promise = $mmaModScorm.getScormUserData(scorm.id, result.attempt).catch(function() {
+                        offline = true;
+                        return $mmaModScormHelper.createOfflineAttempt(scorm, result.attempt, attemptsData.online.length);
+                    });
+                }
             } else {
-                promise = $q.when(false);
+                promise = $q.when();
             }
-            return promise.then(function(incomplete) {
-                var result = $mmaModScorm.determineAttemptAndMode(scorm, mode, attempt, newAttempt, incomplete);
+            return promise.then(function() {
                 mode = result.mode;
                 newAttempt = result.newAttempt;
                 attempt = result.attempt;
                 $scope.isBrowse = mode === $mmaModScorm.MODEBROWSE;
                 $scope.isReview = mode === $mmaModScorm.MODEREVIEW;
-                var promises = [];
-                promises.push(fetchToc());
-                promises.push($mmaModScorm.getScormUserData(scorm.id, attempt).then(function(data) {
-                    userData = data;
-                }));
-                return $q.all(promises);
             });
-        }, showError);
+        });
     }
     function showError(message) {
         if (message) {
@@ -14682,9 +14746,9 @@ angular.module('mm.addons.mod_scorm')
     }
     function fetchToc() {
         $scope.loadingToc = true;
-        return $mmaModScorm.isAttemptIncomplete(scorm, attempt).then(function(incomplete) {
+        return $mmaModScorm.isAttemptIncomplete(scorm, attempt, offline).then(function(incomplete) {
             scorm.incomplete = incomplete;
-            return $mmaModScorm.getOrganizationToc(scorm.id, organizationId, attempt).then(function(toc) {
+            return $mmaModScorm.getOrganizationToc(scorm.id, organizationId, attempt, offline).then(function(toc) {
                 $scope.toc = $mmaModScorm.formatTocToArray(toc);
                 angular.forEach($scope.toc, function(sco) {
                     sco.image = $mmaModScorm.getScoStatusIcon(sco, scorm.incomplete);
@@ -14693,7 +14757,8 @@ angular.module('mm.addons.mod_scorm')
                     currentSco = $mmaModScormHelper.getScoFromToc($scope.toc, $stateParams.scoId);
                 }
                 if (!currentSco) {
-                    return $mmaModScormHelper.getFirstSco(scorm.id, $scope.toc, organizationId, attempt).then(function(sco) {
+                    return $mmaModScormHelper.getFirstSco(scorm.id, $scope.toc, organizationId, attempt, offline)
+                            .then(function(sco) {
                         if (sco) {
                             currentSco = sco;
                         } else {
@@ -14702,8 +14767,7 @@ angular.module('mm.addons.mod_scorm')
                     });
                 }
             });
-        }).catch(showError)
-        .finally(function() {
+        }).finally(function() {
             $scope.loadingToc = false;
         });
     }
@@ -14713,7 +14777,7 @@ angular.module('mm.addons.mod_scorm')
     }
     function loadSco(sco) {
         if (!apiInitialized) {
-            $mmaModScormDataModel12.initAPI(scorm, sco.id, attempt, userData, mode);
+            $mmaModScormDataModel12.initAPI(scorm, sco.id, attempt, userData, mode, offline);
             apiInitialized = true;
         } else {
             $mmaModScormDataModel12.loadSco(sco.id);
@@ -14736,14 +14800,14 @@ angular.module('mm.addons.mod_scorm')
                 element: 'cmi.core.lesson_status',
                 value: 'completed'
             }];
-            $mmaModScorm.saveTracks(sco.id, attempt, tracks).then(function() {
+            $mmaModScorm.saveTracks(sco.id, attempt, tracks, offline, scorm).then(function() {
                 refreshToc();
             });
         }
     }
     function refreshToc() {
         $mmaModScorm.invalidateAllScormData(scorm.id).finally(function() {
-            fetchToc();
+            fetchToc().catch(showError);
         });
     }
     function setStartTime(scoId) {
@@ -14751,7 +14815,7 @@ angular.module('mm.addons.mod_scorm')
             element: 'x.start.time',
             value: $mmUtil.timestamp()
         }];
-        return $mmaModScorm.saveTracks(scoId, attempt, tracks);
+        return $mmaModScorm.saveTracks(scoId, attempt, tracks, offline, scorm);
     }
     $scope.showToc = $mmaModScorm.displayTocInPlayer(scorm);
     if ($scope.showToc) {
@@ -14763,7 +14827,8 @@ angular.module('mm.addons.mod_scorm')
     }
     fetchData().then(function() {
         if (currentSco) {
-            return setStartTime(currentSco.id).catch(showError).finally(function() {
+            var promise = newAttempt ? setStartTime(currentSco.id) : $q.when();
+            return promise.catch(showError).finally(function() {
                 loadSco(currentSco);
             });
         }
@@ -14779,7 +14844,11 @@ angular.module('mm.addons.mod_scorm')
     };
     var tocObserver = $mmEvents.on(mmaModScormEventUpdateToc, function(data) {
         if (data.scormid === scorm.id) {
-            refreshToc();
+            if (offline) {
+                $timeout(refreshToc, 100);
+            } else {
+                refreshToc();
+            }
         }
     });
     var launchNextObserver = $mmEvents.on(mmaModScormEventLaunchNextSco, function(data) {
@@ -14792,10 +14861,21 @@ angular.module('mm.addons.mod_scorm')
             loadSco($scope.previousSco);
         }
     });
+    var goOfflineObserver = $mmEvents.on(mmaModScormEventGoOffline, function(data) {
+        if (data.scormid === scorm.id && !offline) {
+            offline = true;
+            $timeout(function() {
+                $mmaModScormHelper.convertAttemptToOffline(scorm, attempt).catch(showError).finally(function() {
+                    refreshToc();
+                });
+            }, 500);
+        }
+    });
     $scope.$on('$destroy', function() {
         tocObserver && tocObserver.off && tocObserver.off();
         launchNextObserver && launchNextObserver.off && launchNextObserver.off();
         launchPrevObserver && launchPrevObserver.off && launchPrevObserver.off();
+        goOfflineObserver && goOfflineObserver.off && goOfflineObserver.off();
     });
 }]);
 
@@ -14878,13 +14958,20 @@ angular.module('mm.addons.mod_scorm')
 }]);
 
 angular.module('mm.addons.mod_scorm')
-.factory('$mmaModScormDataModel12', ["$mmaModScorm", "$mmEvents", "$window", "mmaModScormEventLaunchNextSco", "mmaModScormEventLaunchPrevSco", "mmaModScormEventUpdateToc", function($mmaModScorm, $mmEvents, $window, mmaModScormEventLaunchNextSco,
-            mmaModScormEventLaunchPrevSco, mmaModScormEventUpdateToc) {
+.factory('$mmaModScormDataModel12', ["$mmaModScorm", "$mmEvents", "$window", "mmaModScormEventLaunchNextSco", "mmaModScormEventLaunchPrevSco", "mmaModScormEventUpdateToc", "mmaModScormEventGoOffline", function($mmaModScorm, $mmEvents, $window, mmaModScormEventLaunchNextSco,
+            mmaModScormEventLaunchPrevSco, mmaModScormEventUpdateToc, mmaModScormEventGoOffline) {
     var self = {};
-        function SCORMAPI(scorm, scoId, attempt, userData, mode) {
+        function SCORMAPI(scorm, scoId, attempt, userData, mode, offline) {
         var currentUserData = {},
             self = this;
         self.scoId = scoId;
+        function triggerEvent(name) {
+            $mmEvents.trigger(name, {
+                scormid: scorm.id,
+                scoid: self.scoId,
+                attempt: attempt
+            });
+        }
         CMIString256 = '^[\\u0000-\\uFFFF]{0,255}$';
         CMIString4096 = '^[\\u0000-\\uFFFF]{0,4096}$';
         CMITime = '^([0-2]{1}[0-9]{1}):([0-5]{1}[0-9]{1}):([0-5]{1}[0-9]{1})(\.[0-9]{1,2})?$';
@@ -14917,7 +15004,7 @@ angular.module('mm.addons.mod_scorm')
         text_range = '-1#1';
         var def = {};
         var defExtra = {};
-        userData.forEach(function(sco) {
+        angular.forEach(userData, function(sco) {
             def[sco.scoid] = sco.defaultdata;
             defExtra[sco.scoid] = sco.userdata;
         });
@@ -15133,7 +15220,7 @@ angular.module('mm.addons.mod_scorm')
                     }
                 }
                 if (getEl('cmi.core.lesson_mode') == $mmaModScorm.MODEBROWSE) {
-                    if (datamodel[scoid]['cmi.core.lesson_status'].defaultvalue == '' && getEl('cmi.core.lesson_status') == 'not attempted') {
+                    if (datamodel[self.scoId]['cmi.core.lesson_status'].defaultvalue == '' && getEl('cmi.core.lesson_status') == 'not attempted') {
                         setEl('cmi.core.lesson_status', 'browsed');
                     }
                 }
@@ -15142,7 +15229,13 @@ angular.module('mm.addons.mod_scorm')
             } else {
                 tracks = CollectData();
             }
-            return $mmaModScorm.saveTracksSync(self.scoId, attempt, tracks);
+            var success = $mmaModScorm.saveTracksSync(self.scoId, attempt, tracks, offline, scorm, currentUserData);
+            if (!offline && !success) {
+                offline = true;
+                triggerEvent(mmaModScormEventGoOffline);
+                return $mmaModScorm.saveTracksSync(self.scoId, attempt, tracks, offline, scorm, currentUserData);
+            }
+            return success;
         }
                 function CollectData() {
             var data = [];
@@ -15151,25 +15244,25 @@ angular.module('mm.addons.mod_scorm')
                     expression = new RegExp(CMIIndex,'g');
                     elementmodel = String(element).replace(expression,'.n.');
                     if (element != "cmi.core.session_time") {
-                        if (typeof datamodel[scoid][element] == "undefined" &&
-                                typeof datamodel[scoid][elementmodel] != "undefined") {
-                            datamodel[scoid][element] = CloneObj(datamodel[scoid][elementmodel]);
+                        if (typeof datamodel[self.scoId][element] == "undefined" &&
+                                typeof datamodel[self.scoId][elementmodel] != "undefined") {
+                            datamodel[self.scoId][element] = CloneObj(datamodel[self.scoId][elementmodel]);
                         }
-                        if (typeof datamodel[scoid][element] != "undefined") {
-                            if (datamodel[scoid][element].mod != 'r') {
+                        if (typeof datamodel[self.scoId][element] != "undefined") {
+                            if (datamodel[self.scoId][element].mod != 'r') {
                                 var el = {
                                     'element': element.replace(expression, "_$1."),
                                     'value': getEl(element)
                                 };
-                                if (typeof datamodel[scoid][element].defaultvalue != "undefined") {
-                                    if (datamodel[scoid][element].defaultvalue != el['value'] ||
-                                            typeof datamodel[scoid][element].defaultvalue != typeof(el['value'])) {
+                                if (typeof datamodel[self.scoId][element].defaultvalue != "undefined") {
+                                    if (datamodel[self.scoId][element].defaultvalue != el['value'] ||
+                                            typeof datamodel[self.scoId][element].defaultvalue != typeof(el['value'])) {
                                         data.push(el);
-                                        datamodel[scoid][element].defaultvalue = el['value'];
+                                        datamodel[self.scoId][element].defaultvalue = el['value'];
                                     }
                                 } else {
                                     data.push(el);
-                                    datamodel[scoid][element].defaultvalue = el['value'];
+                                    datamodel[self.scoId][element].defaultvalue = el['value'];
                                 }
                             }
                         }
@@ -15204,33 +15297,17 @@ angular.module('mm.addons.mod_scorm')
                     result = StoreData(true);
                     if (getEl('nav.event') != '') {
                         if (getEl('nav.event') == 'continue') {
-                            $mmEvents.trigger(mmaModScormEventLaunchNextSco, {
-                                scormid: scorm.id,
-                                scoid: self.scoId,
-                                attempt: attempt
-                            });
+                            triggerEvent(mmaModScormEventLaunchNextSco);
                         } else {
-                            $mmEvents.trigger(mmaModScormEventLaunchPrevSco, {
-                                scormid: scorm.id,
-                                scoid: self.scoId,
-                                attempt: attempt
-                            });
+                            triggerEvent(mmaModScormEventLaunchPrevSco);
                         }
                     } else {
                         if (scorm.auto == '1') {
-                            $mmEvents.trigger(mmaModScormEventLaunchNextSco, {
-                                scormid: scorm.id,
-                                scoid: self.scoId,
-                                attempt: attempt
-                            });
+                            triggerEvent(mmaModScormEventLaunchNextSco);
                         }
                     }
                     errorCode = (result) ? '0' : '101';
-                    $mmEvents.trigger(mmaModScormEventUpdateToc, {
-                        scormid: scorm.id,
-                        scoid: self.scoId,
-                        attempt: attempt
-                    });
+                    triggerEvent(mmaModScormEventUpdateToc);
                     return result;
                 } else {
                     errorCode = "301";
@@ -15246,26 +15323,26 @@ angular.module('mm.addons.mod_scorm')
                 if (element != "") {
                     expression = new RegExp(CMIIndex,'g');
                     elementmodel = String(element).replace(expression,'.n.');
-                    if (typeof datamodel[scoid][elementmodel] != "undefined") {
-                        if (datamodel[scoid][elementmodel].mod != 'w') {
+                    if (typeof datamodel[self.scoId][elementmodel] != "undefined") {
+                        if (datamodel[self.scoId][elementmodel].mod != 'w') {
                             errorCode = "0";
                             return getEl(element);
                         } else {
-                            errorCode = datamodel[scoid][elementmodel].readerror;
+                            errorCode = datamodel[self.scoId][elementmodel].readerror;
                         }
                     } else {
                         childrenstr = '._children';
                         countstr = '._count';
                         if (elementmodel.substr(elementmodel.length - childrenstr.length,elementmodel.length) == childrenstr) {
                             parentmodel = elementmodel.substr(0,elementmodel.length - childrenstr.length);
-                            if (typeof datamodel[scoid][parentmodel] != "undefined") {
+                            if (typeof datamodel[self.scoId][parentmodel] != "undefined") {
                                 errorCode = "202";
                             } else {
                                 errorCode = "201";
                             }
                         } else if (elementmodel.substr(elementmodel.length - countstr.length,elementmodel.length) == countstr) {
                             parentmodel = elementmodel.substr(0,elementmodel.length - countstr.length);
-                            if (typeof datamodel[scoid][parentmodel] != "undefined") {
+                            if (typeof datamodel[self.scoId][parentmodel] != "undefined") {
                                 errorCode = "203";
                             } else {
                                 errorCode = "201";
@@ -15288,9 +15365,9 @@ angular.module('mm.addons.mod_scorm')
                 if (element != "") {
                     expression = new RegExp(CMIIndex,'g');
                     elementmodel = String(element).replace(expression,'.n.');
-                    if (typeof datamodel[scoid][elementmodel] != "undefined") {
-                        if (datamodel[scoid][elementmodel].mod != 'r') {
-                            expression = new RegExp(datamodel[scoid][elementmodel].format);
+                    if (typeof datamodel[self.scoId][elementmodel] != "undefined") {
+                        if (datamodel[self.scoId][elementmodel].mod != 'r') {
+                            expression = new RegExp(datamodel[self.scoId][elementmodel].format);
                             value = value + '';
                             matches = value.match(expression);
                             if (matches != null) {
@@ -15342,8 +15419,8 @@ angular.module('mm.addons.mod_scorm')
                                     if (scorm.autocommit && !(timeout)) {
                                         timeout = setTimeout(self.LMSCommit, 60000, [""]);
                                     }
-                                    if (typeof datamodel[scoid][elementmodel].range != "undefined") {
-                                        range = datamodel[scoid][elementmodel].range;
+                                    if (typeof datamodel[self.scoId][elementmodel].range != "undefined") {
+                                        range = datamodel[self.scoId][elementmodel].range;
                                         ranges = range.split('#');
                                         value = value * 1.0;
                                         if ((value >= ranges[0]) && (value <= ranges[1])) {
@@ -15351,7 +15428,7 @@ angular.module('mm.addons.mod_scorm')
                                             errorCode = "0";
                                             return "true";
                                         } else {
-                                            errorCode = datamodel[scoid][elementmodel].writeerror;
+                                            errorCode = datamodel[self.scoId][elementmodel].writeerror;
                                         }
                                     } else {
                                         if (element == 'cmi.comments') {
@@ -15364,10 +15441,10 @@ angular.module('mm.addons.mod_scorm')
                                     }
                                 }
                             } else {
-                                errorCode = datamodel[scoid][elementmodel].writeerror;
+                                errorCode = datamodel[self.scoId][elementmodel].writeerror;
                             }
                         } else {
-                            errorCode = datamodel[scoid][elementmodel].writeerror;
+                            errorCode = datamodel[self.scoId][elementmodel].writeerror;
                         }
                     } else {
                         errorCode = "201";
@@ -15389,11 +15466,7 @@ angular.module('mm.addons.mod_scorm')
             if (param == "") {
                 if (initialized) {
                     result = StoreData(false);
-                    $mmEvents.trigger(mmaModScormEventUpdateToc, {
-                        scormid: scorm.id,
-                        scoid: self.scoId,
-                        attempt: attempt
-                    });
+                    triggerEvent(mmaModScormEventUpdateToc);
                     errorCode = result ? '0' : '101';
                     return result;
                 } else {
@@ -15433,9 +15506,9 @@ angular.module('mm.addons.mod_scorm')
             return param;
         };
     }
-        self.initAPI = function(scorm, scoId, attempt, userData, mode) {
+        self.initAPI = function(scorm, scoId, attempt, userData, mode, offline) {
         mode = mode || $mmaModScorm.MODENORMAL;
-        $window.API = new SCORMAPI(scorm, scoId, attempt, userData, mode);
+        $window.API = new SCORMAPI(scorm, scoId, attempt, userData, mode, offline);
     };
         self.loadSco = function(scoId) {
         $window.API.scoId = scoId;
@@ -15444,8 +15517,50 @@ angular.module('mm.addons.mod_scorm')
 }]);
 
 angular.module('mm.addons.mod_scorm')
-.factory('$mmaModScormHelper', ["$mmaModScorm", "$mmUtil", "$translate", "$q", function($mmaModScorm, $mmUtil, $translate, $q) {
-    var self = {};
+.factory('$mmaModScormHelper', ["$mmaModScorm", "$mmUtil", "$translate", "$q", "$mmaModScormOffline", function($mmaModScorm, $mmUtil, $translate, $q, $mmaModScormOffline) {
+    var self = {},
+        elementsToIgnore = ['status', 'score_raw', 'total_time', 'session_time', 'student_id', 'student_name', 'credit',
+                            'mode', 'entry'];
+        self.convertAttemptToOffline = function(scorm, attempt) {
+        return $mmaModScorm.getScormUserData(scorm.id, attempt).then(function(onlineData) {
+            return $mmaModScormOffline.getScormUserData(scorm.id, attempt).catch(function() {
+            }).then(function(offlineData) {
+                angular.forEach(onlineData, function(sco) {
+                    elementsToIgnore.forEach(function(el) {
+                        delete sco.userdata[el];
+                    });
+                    if (offlineData && offlineData[sco.scoid] && offlineData[sco.scoid].userdata) {
+                        var scoUserData = {};
+                        angular.forEach(sco.userdata, function(value, element) {
+                            if (!offlineData[sco.scoid].userdata[element]) {
+                                scoUserData[element] = value;
+                            }
+                        });
+                        sco.userdata = scoUserData;
+                    }
+                });
+                return $mmaModScormOffline.createNewAttempt(scorm, undefined, attempt, onlineData, true);
+            });
+        }).catch(function() {
+            return $q.reject($translate.instant('mma.mod_scorm.errorcreateofflineattempt'));
+        });
+    };
+        self.createOfflineAttempt = function(scorm, newAttempt, lastOnline) {
+        return self.searchOnlineAttemptUserData(scorm.id, lastOnline).then(function(userData) {
+            angular.forEach(userData, function(sco) {
+                var filtered = {};
+                angular.forEach(sco.userdata, function(value, element) {
+                    if (element.indexOf('.') == -1 && elementsToIgnore.indexOf(element) == -1) {
+                        filtered[element] = value;
+                    }
+                });
+                sco.userdata = filtered;
+            });
+            return $mmaModScormOffline.createNewAttempt(scorm, undefined, newAttempt, userData);
+        }).catch(function() {
+            return $q.reject($translate.instant('mma.mod_scorm.errorcreateofflineattempt'));
+        });
+    };
         self.confirmDownload = function(scorm) {
         var promise;
         if (!scorm.packagesize) {
@@ -15460,12 +15575,12 @@ angular.module('mm.addons.mod_scorm')
             return $mmUtil.confirmDownloadSize(size);
         });
     };
-        self.getFirstSco = function(scormid, toc, organization, attempt) {
+        self.getFirstSco = function(scormid, toc, organization, attempt, offline) {
         var promise;
         if (toc && toc.length) {
             promise = $q.when(toc);
         } else {
-            promise = $mmaModScorm.getScosWithData(scormid, organization, attempt);
+            promise = $mmaModScorm.getScosWithData(scormid, organization, attempt, offline);
         }
         return promise.then(function(scos) {
             for (var i = 0; i < scos.length; i++) {
@@ -15506,6 +15621,15 @@ angular.module('mm.addons.mod_scorm')
                 return toc[i];
             }
         }
+    };
+        self.searchOnlineAttemptUserData = function(scormId, attempt) {
+        return $mmaModScorm.getScormUserData(scormId, attempt).catch(function() {
+            if (attempt > 0) {
+                return self.searchOnlineAttemptUserData(scormId, attempt - 1);
+            } else {
+                return $q.reject();
+            }
+        });
     };
         self.showDownloadError = function(scorm) {
         $translate('mma.mod_scorm.errordownloadscorm', {name: scorm.name}).then(function(message) {
@@ -15557,8 +15681,8 @@ angular.module('mm.addons.mod_scorm')
 }]);
 
 angular.module('mm.addons.mod_scorm')
-.factory('$mmaModScorm', ["$mmSite", "$q", "$translate", "$mmLang", "$mmFilepool", "$mmFS", "$mmWS", "$sce", "mmaModScormComponent", "mmCoreNotDownloaded", function($mmSite, $q, $translate, $mmLang, $mmFilepool, $mmFS, $mmWS, $sce,
-            mmaModScormComponent, mmCoreNotDownloaded) {
+.factory('$mmaModScorm', ["$mmSite", "$q", "$translate", "$mmLang", "$mmFilepool", "$mmFS", "$mmWS", "$sce", "$mmaModScormOnline", "$mmaModScormOffline", "$mmUtil", "mmaModScormComponent", "mmCoreNotDownloaded", function($mmSite, $q, $translate, $mmLang, $mmFilepool, $mmFS, $mmWS, $sce, $mmaModScormOnline,
+            $mmaModScormOffline, $mmUtil, mmaModScormComponent, mmCoreNotDownloaded) {
     var self = {},
         statuses = ['notattempted', 'passed', 'completed', 'failed', 'incomplete', 'browsed', 'suspend'],
         downloadPromises = {};
@@ -15573,27 +15697,36 @@ angular.module('mm.addons.mod_scorm')
     self.MODEBROWSE = 'browse';
     self.MODENORMAL = 'normal';
     self.MODEREVIEW = 'review';
-        self.calculateScormGrade = function(scorm, attempts) {
-        if (!attempts.length) {
+        self.calculateScormGrade = function(scorm, onlineAttempts) {
+        if (!Object.keys(onlineAttempts).length) {
             return -1;
         }
         switch (scorm.whatgrade) {
             case self.FIRSTATTEMPT:
-                return attempts[0].grade;
+                return onlineAttempts[1] ? onlineAttempts[1].grade : -1;
             case self.LASTATTEMPT:
-                return attempts[attempts.length - 1].grade;
+                var max = 0;
+                angular.forEach(Object.keys(onlineAttempts), function(number) {
+                    max = Math.max(number, max);
+                });
+                if (max > 0) {
+                    return onlineAttempts[max].grade;
+                }
+                return -1;
             case self.HIGHESTATTEMPT:
                 var grade = 0;
-                for (var attempt = 0; attempt < attempts.length; attempt++) {
-                    grade = Math.max(attempts[attempt].grade, grade);
-                }
+                angular.forEach(onlineAttempts, function(attempt) {
+                    grade = Math.max(attempt.grade, grade);
+                });
                 return grade;
             case self.AVERAGEATTEMPT:
-                var sumgrades = 0;
-                for (var att = 0; att < attempts.length; att++) {
-                    sumgrades += attempts[att].grade;
-                }
-                return Math.round(sumgrades / attempts.length);
+                var sumgrades = 0,
+                    total = 0;
+                angular.forEach(onlineAttempts, function(attempt) {
+                    sumgrades += attempt.grade;
+                    total++;
+                });
+                return Math.round(sumgrades / total);
         }
         return -1;
     };
@@ -15785,7 +15918,8 @@ angular.module('mm.addons.mod_scorm')
             return $translate.instant('mm.core.none');
         }
         if (scorm.grademethod !== self.GRADESCOES && scorm.maxgrade > 0) {
-            return $translate.instant('mm.core.percentagenumber', {$a: (grade / scorm.maxgrade) * 100});
+            grade = (grade / scorm.maxgrade) * 100;
+            return $translate.instant('mm.core.percentagenumber', {$a: $mmUtil.roundToDecimals(grade, 2)});
         }
         return grade;
     };
@@ -15804,35 +15938,53 @@ angular.module('mm.addons.mod_scorm')
         });
         return formatted;
     };
-        function getAttemptCountCacheKey(scormid, userid) {
-        userid = userid || $mmSite.getUserId();
-        return 'mmaModScorm:attemptcount:' + scormid + ':' + userid;
-    }
-        self.getAttemptCount = function(scormid, userid, ignoreMissing) {
-        userid = userid || $mmSite.getUserId();
-        var params = {
-                scormid: scormid,
-                userid: userid,
-                ignoremissingcompletion: ignoreMissing ? 1 : 0
+        self.getAttemptCount = function(scormId, userId, ignoreMissing) {
+        userId = userId || $mmSite.getUserId();
+        var result = {
+                lastAttempt: {
+                    number: 0,
+                    offline: false
+                }
             },
-            preSets = {
-                cacheKey: getAttemptCountCacheKey(scormid, userid)
-            };
-        return $mmSite.read('mod_scorm_get_scorm_attempt_count', params, preSets).then(function(response) {
-            if (response && typeof response.attemptscount != 'undefined') {
-                return response.attemptscount;
+            promises = [];
+        promises.push($mmaModScormOnline.getAttemptCount(scormId, userId, ignoreMissing).then(function(count) {
+            result.online = [];
+            for (var i = 1; i <= count; i++) {
+                result.online.push(i);
             }
-            return $q.reject();
+            if (count > result.lastAttempt.number) {
+                result.lastAttempt.number = count;
+                result.lastAttempt.offline = false;
+            }
+        }));
+        promises.push($mmaModScormOffline.getAttempts(scormId, userId).then(function(attempts) {
+            result.offline = attempts.map(function(entry) {
+                if (entry.attempt >= result.lastAttempt.number) {
+                    result.lastAttempt.number = entry.attempt;
+                    result.lastAttempt.offline = true;
+                }
+                return entry.attempt;
+            });
+        }));
+        return $q.all(promises).then(function() {
+            var total = result.online.length;
+            result.offline.forEach(function(attempt) {
+                if (result.online.indexOf(attempt) == -1) {
+                    total++;
+                }
+            });
+            result.total = total;
+            return result;
         });
     };
-        self.getAttemptGrade = function(scorm, attempt) {
+        self.getAttemptGrade = function(scorm, attempt, offline) {
         var attemptscore = {
             scos: 0,
             values: 0,
             max: 0,
             sum: 0
         };
-        return self.getScormUserData(scorm.id, attempt).then(function(data) {
+        return self.getScormUserData(scorm.id, attempt, offline).then(function(data) {
             angular.forEach(data, function(scodata) {
                 var userdata = scodata.userdata;
                 if (userdata.status == 'completed' || userdata.status == 'passed') {
@@ -15843,7 +15995,7 @@ angular.module('mm.addons.mod_scorm')
                     var scoreraw = parseFloat(userdata.score_raw);
                     attemptscore.values++;
                     attemptscore.sum += scoreraw;
-                    attemptscore.max = (scoreraw > attemptscore.max) ? scoreraw : attemptscore.max;
+                    attemptscore.max = Math.max(scoreraw, attemptscore.max);
                 }
             });
             var score = 0;
@@ -15885,8 +16037,8 @@ angular.module('mm.addons.mod_scorm')
             return organizations;
         });
     };
-        self.getOrganizationToc = function(scormid, organization, attempt) {
-        return self.getScosWithData(scormid, organization, attempt).then(function(scos) {
+        self.getOrganizationToc = function(scormid, organization, attempt, offline) {
+        return self.getScosWithData(scormid, organization, attempt, offline).then(function(scos) {
             var map = {},
                 rootScos = [];
             angular.forEach(scos, function(sco, index) {
@@ -15911,6 +16063,16 @@ angular.module('mm.addons.mod_scorm')
             return scorm.reference;
         }
         return '';
+    };
+        self.getScormUserData = function(scormId, attempt, offline, scos) {
+        if (offline) {
+            var promise = scos ? $q.when(scos) : self.getScos(scormId);
+            return promise.then(function(scos) {
+                return $mmaModScormOffline.getScormUserData(scormId, attempt, scos);
+            });
+        } else {
+            return $mmaModScormOnline.getScormUserData(scormId, attempt);
+        }
     };
         function getScosCacheKey(scormid) {
         return 'mmaModScorm:scos:' + scormid;
@@ -15940,19 +16102,15 @@ angular.module('mm.addons.mod_scorm')
             return $q.reject();
         });
     };
-        self.getScosWithData = function(scormid, organization, attempt) {
-        return self.getScormUserData(scormid, attempt).then(function(data) {
-            var trackData = {};
-            angular.forEach(data, function(sco) {
-                trackData[sco.scoid] = sco.userdata;
-            });
-            return self.getScos(scormid, organization).then(function(scos) {
+        self.getScosWithData = function(scormid, organization, attempt, offline) {
+        return self.getScos(scormid, organization).then(function(scos) {
+            return self.getScormUserData(scormid, attempt, offline, scos).then(function(data) {
                 var trackDataBySCO = {};
                 angular.forEach(scos, function(sco) {
-                    trackDataBySCO[sco.identifier] = trackData[sco.id];
+                    trackDataBySCO[sco.identifier] = data[sco.id].userdata;
                 });
                 angular.forEach(scos, function(sco) {
-                    var scodata = trackData[sco.id];
+                    var scodata = data[sco.id].userdata;
                     if (!scodata) {
                         return;
                     }
@@ -16080,48 +16238,12 @@ angular.module('mm.addons.mod_scorm')
             }
         }
     };
-        function getScormUserDataCacheKey(scormid, attempt) {
-        return getScormUserDataCommonCacheKey(scormid) + ':' + attempt;
-    }
-        function getScormUserDataCommonCacheKey(scormid) {
-        return 'mmaModScorm:userdata:' + scormid;
-    }
-        self.getScormUserData = function(scormid, attempt) {
-        var params = {
-                scormid: scormid,
-                attempt: attempt
-            },
-            preSets = {
-                cacheKey: getScormUserDataCacheKey(scormid, attempt)
-            };
-        return $mmSite.read('mod_scorm_get_scorm_user_data', params, preSets).then(function(response) {
-            if (response && response.data) {
-                angular.forEach(response.data, function(sco) {
-                    var formattedDefaultData = {},
-                        formattedUserData = {};
-                    angular.forEach(sco.defaultdata, function(entry) {
-                        formattedDefaultData[entry.element] = entry.value;
-                    });
-                    angular.forEach(sco.userdata, function(entry) {
-                        formattedUserData[entry.element] = entry.value;
-                    });
-                    sco.defaultdata = formattedDefaultData;
-                    sco.userdata = formattedUserData;
-                });
-                return response.data;
-            }
-            return $q.reject();
-        });
-    };
         self.invalidateAllScormData = function(scormid, userid) {
         var promises = [];
-        promises.push(self.invalidateAttemptCount(scormid, userid));
+        promises.push($mmaModScormOnline.invalidateAttemptCount(scormid, userid));
         promises.push(self.invalidateScos(scormid));
-        promises.push(self.invalidateScormUserData(scormid));
+        promises.push($mmaModScormOnline.invalidateScormUserData(scormid));
         return $q.all(promises);
-    };
-        self.invalidateAttemptCount = function(scormid, userid) {
-        return $mmSite.invalidateWsCacheForKey(getAttemptCountCacheKey(scormid, userid));
     };
         self.invalidateContent = function(moduleId) {
         return $mmFilepool.invalidateFilesByComponent($mmSite.getId(), mmaModScormComponent, moduleId);
@@ -16132,11 +16254,8 @@ angular.module('mm.addons.mod_scorm')
         self.invalidateScormData = function(courseid) {
         return $mmSite.invalidateWsCacheForKey(getScormDataCacheKey(courseid));
     };
-        self.invalidateScormUserData = function(scormid) {
-        return $mmSite.invalidateWsCacheForKeyStartingWith(getScormUserDataCommonCacheKey(scormid));
-    };
-        self.isAttemptIncomplete = function(scorm, attempt) {
-        return self.getScosWithData(scorm.id, undefined, attempt).then(function(scos) {
+        self.isAttemptIncomplete = function(scorm, attempt, offline) {
+        return self.getScosWithData(scorm.id, undefined, attempt, offline).then(function(scos) {
             var incomplete = false;
             angular.forEach(scos, function(sco) {
                 if (sco.isvisible && sco.launch) {
@@ -16147,9 +16266,6 @@ angular.module('mm.addons.mod_scorm')
             });
             return incomplete;
         });
-    };
-        self.isStatusIncomplete = function(status) {
-        return !status || status == 'notattempted' || status == 'incomplete' || status == 'browsed';
     };
         self.isPluginEnabled = function() {
         return  $mmSite.wsAvailable('mod_scorm_get_scorm_attempt_count') &&
@@ -16189,6 +16305,9 @@ angular.module('mm.addons.mod_scorm')
         self.isScormValidVersion = function(scorm) {
         return scorm.version == 'SCORM_1.2';
     };
+        self.isStatusIncomplete = function(status) {
+        return !status || status == 'notattempted' || status == 'incomplete' || status == 'browsed';
+    };
         self.isValidPackageUrl = function(packageurl) {
         if (!packageurl) {
             return false;
@@ -16216,7 +16335,7 @@ angular.module('mm.addons.mod_scorm')
     };
         self.prefetchData = function(scorm) {
         var promises = [];
-        promises.push(self.getAttemptCount(scorm.id).catch(function() {
+        promises.push($mmaModScormOnline.getAttemptCount(scorm.id).catch(function() {
             return 0;
         }).then(function(numAttempts) {
             if (numAttempts > 0) {
@@ -16226,7 +16345,7 @@ angular.module('mm.addons.mod_scorm')
                     attempts.push(i);
                 }
                 attempts.forEach(function(attempt) {
-                    datapromises.push(self.getScormUserData(scorm.id, attempt).catch(function(err) {
+                    datapromises.push($mmaModScormOnline.getScormUserData(scorm.id, attempt).catch(function(err) {
                         if (attempt == numAttempts) {
                             return $q.reject(err);
                         }
@@ -16234,16 +16353,436 @@ angular.module('mm.addons.mod_scorm')
                 });
                 return $q.all(datapromises);
             } else {
-                return self.getScormUserData(scorm.id, 0);
+                return $mmaModScormOnline.getScormUserData(scorm.id, 0);
             }
         }));
         promises.push(self.getScos(scorm.id));
-        promises.push(self.getAttemptCount(scorm.id, undefined, true).catch(function(){
-        }));
         return $q.all(promises);
     };
         self.prefetchPackage = function(scorm) {
         return self._downloadOrPrefetch(scorm, true);
+    };
+        self.saveTracks = function(scoId, attempt, tracks, offline, scorm, userData) {
+        if (offline) {
+            var promise = userData ? $q.when(userData) : self.getScormUserData(scorm.id, attempt, offline);
+            return promise.then(function(userData) {
+                return $mmaModScormOffline.saveTracks(scorm, scoId, attempt, tracks, userData);
+            });
+        } else {
+            return $mmaModScormOnline.saveTracks(scoId, attempt, tracks);
+        }
+    };
+        self.saveTracksSync = function(scoId, attempt, tracks, offline, scorm, userData) {
+        if (offline) {
+            return $mmaModScormOffline.saveTracksSync(scorm, scoId, attempt, tracks, userData);
+        } else {
+            return $mmaModScormOnline.saveTracksSync(scoId, attempt, tracks);
+        }
+    };
+    return self;
+}]);
+
+angular.module('mm.addons.mod_scorm')
+.constant('mmaModScormOfflineAttemptsStore', 'mod_scorm_offline_attempts')
+.constant('mmaModScormOfflineTracksStore', 'mod_scorm_offline_scos_tracks')
+.config(["$mmSitesFactoryProvider", "mmaModScormOfflineAttemptsStore", "mmaModScormOfflineTracksStore", function($mmSitesFactoryProvider, mmaModScormOfflineAttemptsStore, mmaModScormOfflineTracksStore) {
+    var stores = [
+        {
+            name: mmaModScormOfflineAttemptsStore,
+            keyPath: ['scormid', 'userid', 'attempt'],
+            indexes: [
+                {
+                    name: 'attempt'
+                },
+                {
+                    name: 'userid'
+                },
+                {
+                    name: 'scormid'
+                },
+                {
+                    name: 'timemodified'
+                },
+                {
+                    name: 'scormAndUser',
+                    generator: function(obj) {
+                        return [obj.scormid, obj.userid];
+                    }
+                }
+            ]
+        },
+        {
+            name: mmaModScormOfflineTracksStore,
+            keyPath: ['userid', 'scormid', 'scoid', 'attempt', 'element'],
+            indexes: [
+                {
+                    name: 'userid'
+                },
+                {
+                    name: 'scormid'
+                },
+                {
+                    name: 'scoid'
+                },
+                {
+                    name: 'attempt'
+                },
+                {
+                    name: 'element'
+                },
+                {
+                    name: 'synced'
+                },
+                {
+                    name: 'scormUserAttempt',
+                    generator: function(obj) {
+                        return [obj.scormid, obj.userid, obj.attempt];
+                    }
+                }
+            ]
+        }
+    ];
+    $mmSitesFactoryProvider.registerStores(stores);
+}])
+.factory('$mmaModScormOffline', ["$mmSite", "$mmUtil", "$q", "mmaModScormOfflineAttemptsStore", "mmaModScormOfflineTracksStore", function($mmSite, $mmUtil, $q, mmaModScormOfflineAttemptsStore, mmaModScormOfflineTracksStore) {
+    var self = {};
+        self.createNewAttempt = function(scorm, userId, attempt, userData, copy) {
+        userId = userId || $mmSite.getUserId();
+        var db = $mmSite.getDb(),
+            entry = {
+                scormid: scorm.id,
+                userid: userId,
+                attempt: attempt,
+                timemodified: $mmUtil.timestamp()
+            };
+        if (copy) {
+            userData = removeDefaultData(userData);
+            entry.snapshot = userData;
+        }
+        return db.insert(mmaModScormOfflineAttemptsStore, entry).then(function() {
+            var promises = [];
+            angular.forEach(userData, function(sco) {
+                var tracks = [];
+                angular.forEach(sco.userdata, function(value, element) {
+                    tracks.push({element: element, value: value});
+                });
+                promises.push(self.saveTracks(scorm, sco.scoid, attempt, tracks, userData));
+            });
+            return $q.all(promises);
+        });
+    };
+        function formatInteractions(scoUserData) {
+        var formatted = {};
+        formatted.score_raw = '';
+        formatted.status = '';
+        formatted.total_time = '00:00:00';
+        formatted.session_time = '00:00:00';
+        angular.forEach(scoUserData, function(value, element) {
+            if (element == 'score_raw' || element == 'status' || element == 'total_time' || element == 'session_time') {
+                return;
+            }
+            formatted[element] = value;
+            switch (element) {
+                case 'cmi.core.lesson_status':
+                case 'cmi.completion_status':
+                    if (value == 'not attempted') {
+                        value = 'notattempted';
+                    }
+                    formatted.status = value;
+                    break;
+                case 'cmi.core.score.raw':
+                case 'cmi.score.raw':
+                    formatted.score_raw = $mmUtil.roundToDecimals(value, 2);
+                    break;
+                case 'cmi.core.session_time':
+                case 'cmi.session_time':
+                    formatted.session_time = value;
+                    break;
+                case 'cmi.core.total_time':
+                case 'cmi.total_time':
+                    formatted.total_time = value;
+                    break;
+            }
+        });
+        return formatted;
+    }
+        function getLaunchUrlsFromScos(scos) {
+        var response = {};
+        angular.forEach(scos, function(sco) {
+            response[sco.id] = sco.launch;
+        });
+        return response;
+    }
+        self.getAttempts = function(scormId, userId) {
+        userId = userId || $mmSite.getUserId();
+        var db = $mmSite.getDb();
+        return db.whereEqual(mmaModScormOfflineAttemptsStore, 'scormAndUser', [scormId, userId]).then(function(attempts) {
+            return attempts;
+        });
+    };
+        self.getScormUserData = function(scormId, attempt, scos) {
+        var userId = $mmSite.getUserId(),
+            launchUrls = getLaunchUrlsFromScos(scos),
+            where = ['scormUserAttempt', '=', [scormId, userId, attempt]];
+        return $mmSite.getDb().query(mmaModScormOfflineTracksStore, where).then(function(entries) {
+            var response = {},
+                userId = $mmSite.getUserId(),
+                username = $mmSite.getInfo().username,
+                fullName = $mmSite.getInfo().fullname;
+            angular.forEach(entries, function(entry) {
+                var scoid = entry.scoid;
+                if (!response[scoid]) {
+                    response[scoid] = {
+                        scoid: scoid,
+                        userdata: {
+                            userid: userId,
+                            scoid: scoid,
+                            timemodified: 0
+                        }
+                    };
+                }
+                response[scoid].userdata[entry.element] = entry.value;
+                if (entry.timemodified > response[scoid].userdata.timemodified) {
+                    response[scoid].userdata.timemodified = entry.timemodified;
+                }
+            });
+            angular.forEach(response, function(sco) {
+                sco.userdata = formatInteractions(sco.userdata);
+            });
+            angular.forEach(scos, function(sco) {
+                if (!response[sco.id]) {
+                    response[sco.id] = {
+                        scoid: sco.id,
+                        userdata: {
+                            status: '',
+                            score_raw: ''
+                        }
+                    };
+                }
+            });
+            angular.forEach(response, function(sco) {
+                sco.defaultdata = {};
+                sco.defaultdata['cmi.core.student_id'] = username;
+                sco.defaultdata['cmi.core.student_name'] = fullName;
+                sco.defaultdata['cmi.core.lesson_mode'] = 'normal';
+                sco.defaultdata['cmi.core.credit'] = 'credit';
+                if (sco.userdata.status === '') {
+                    sco.defaultdata['cmi.core.entry'] = 'ab-initio';
+                } else if (sco.userdata['cmi.core.exit'] === 'suspend') {
+                    sco.defaultdata['cmi.core.entry'] = 'resume';
+                } else {
+                    sco.defaultdata['cmi.core.entry'] = '';
+                }
+                sco.defaultdata['cmi.student_data.mastery_score'] = scormIsset(sco.userdata, 'masteryscore');
+                sco.defaultdata['cmi.student_data.max_time_allowed'] = scormIsset(sco.userdata, 'max_time_allowed');
+                sco.defaultdata['cmi.student_data.time_limit_action'] = scormIsset(sco.userdata, 'time_limit_action');
+                sco.defaultdata['cmi.core.total_time'] = scormIsset(sco.userdata, 'cmi.core.total_time', '00:00:00');
+                sco.defaultdata['cmi.launch_data'] = launchUrls[sco.scoid];
+                sco.defaultdata['cmi.core.lesson_location'] = scormIsset(sco.userdata, 'cmi.core.lesson_location');
+                sco.defaultdata['cmi.core.lesson_status'] = scormIsset(sco.userdata, 'cmi.core.lesson_status');
+                sco.defaultdata['cmi.core.score.raw'] = scormIsset(sco.userdata, 'cmi.core.score.raw');
+                sco.defaultdata['cmi.core.score.max'] = scormIsset(sco.userdata, 'cmi.core.score.max');
+                sco.defaultdata['cmi.core.score.min'] = scormIsset(sco.userdata, 'cmi.core.score.min');
+                sco.defaultdata['cmi.core.exit'] = scormIsset(sco.userdata, 'cmi.core.exit');
+                sco.defaultdata['cmi.suspend_data'] = scormIsset(sco.userdata, 'cmi.suspend_data');
+                sco.defaultdata['cmi.comments'] = scormIsset(sco.userdata, 'cmi.comments');
+                sco.defaultdata['cmi.student_preference.language'] = scormIsset(sco.userdata, 'cmi.student_preference.language');
+                sco.defaultdata['cmi.student_preference.audio'] = scormIsset(sco.userdata, 'cmi.student_preference.audio', '0');
+                sco.defaultdata['cmi.student_preference.speed'] = scormIsset(sco.userdata, 'cmi.student_preference.speed', '0');
+                sco.defaultdata['cmi.student_preference.text'] = scormIsset(sco.userdata, 'cmi.student_preference.text', '0');
+                sco.userdata.student_id = username;
+                sco.userdata.student_name = fullName;
+                sco.userdata.mode = sco.defaultdata['cmi.core.lesson_mode'];
+                sco.userdata.credit = sco.defaultdata['cmi.core.credit'];
+                sco.userdata.entry = sco.defaultdata['cmi.core.entry'];
+            });
+            return response;
+        });
+    };
+        function insertTrackToDB(userId, scormId, scoId, attempt, element, value, synchronous) {
+        var entry = {
+            userid: userId,
+            scormid: scormId,
+            scoid: scoId,
+            attempt: attempt,
+            element: element,
+            value: value,
+            timemodified: $mmUtil.timestamp(),
+            synced: false
+        };
+        if (synchronous) {
+            return $mmSite.getDb().insertSync(mmaModScormOfflineTracksStore, entry);
+        } else {
+            return $mmSite.getDb().insert(mmaModScormOfflineTracksStore, entry);
+        }
+    }
+        function insertTrack(userId, scormId, scoId, attempt, element, value, forceCompleted, scoData) {
+        userId = userId || $mmSite.getUserId();
+        scoData = scoData || {};
+        var promises = [],
+            lessonStatusInserted = false,
+            scoUserData = scoData.userdata || {};
+        if (forceCompleted) {
+            if (element == 'cmi.core.lesson_status' && value == 'incomplete') {
+                if (scoUserData['cmi.core.score.raw']) {
+                    value = 'completed';
+                }
+            }
+            if (element == 'cmi.core.score.raw') {
+                if (scoUserData['cmi.core.lesson_status'] == 'incomplete') {
+                    lessonStatusInserted = true;
+                    promises.push(insertTrackToDB(userId, scormId, scoId, attempt, 'cmi.core.lesson_status', 'completed'));
+                }
+            }
+        }
+        return $q.all(promises).then(function() {
+            if (!scoUserData[element] || element != 'x.start.time') {
+                return insertTrackToDB(userId, scormId, scoId, attempt, element, value).catch(function() {
+                    if (lessonStatusInserted) {
+                        return insertTrackToDB(userId, scormId, scoId, attempt, 'cmi.core.lesson_status', 'incomplete')
+                                .then(function() {
+                            return $q.reject();
+                        });
+                    }
+                    return $q.reject();
+                });
+            }
+        });
+    }
+        function insertTrackSync(userId, scormId, scoId, attempt, element, value, forceCompleted, scoData) {
+        userId = userId || $mmSite.getUserId();
+        scoData = scoData || {};
+        var lessonStatusInserted = false,
+            scoUserData = scoData.userdata || {};
+        if (forceCompleted) {
+            if (element == 'cmi.core.lesson_status' && value == 'incomplete') {
+                if (scoUserData['cmi.core.score.raw']) {
+                    value = 'completed';
+                }
+            }
+            if (element == 'cmi.core.score.raw') {
+                if (scoUserData['cmi.core.lesson_status'] == 'incomplete') {
+                    lessonStatusInserted = true;
+                    if (!insertTrackToDB(userId, scormId, scoId, attempt, 'cmi.core.lesson_status', 'completed', true)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if (!scoUserData[element] || element != 'x.start.time') {
+            if (!insertTrackToDB(userId, scormId, scoId, attempt, element, value, true)) {
+                if (lessonStatusInserted) {
+                    insertTrackToDB(userId, scormId, scoId, attempt, 'cmi.core.lesson_status', 'incomplete', true);
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+        function removeDefaultData(userData) {
+        var result = angular.copy(userData);
+        angular.forEach(result, function(sco) {
+            delete sco.defaultdata;
+        });
+        return result;
+    }
+        self.saveTracks = function(scorm, scoId, attempt, tracks, userData) {
+        var userId = $mmSite.getUserId();
+        var promises = [];
+        angular.forEach(tracks, function(track) {
+            promises.push(
+                insertTrack(userId, scorm.id, scoId, attempt, track.element, track.value, scorm.forcecompleted, userData[scoId])
+            );
+        });
+        return $q.all(promises);
+    };
+        self.saveTracksSync = function(scorm, scoId, attempt, tracks, userData) {
+        var userId = $mmSite.getUserId(),
+            success = true;
+        angular.forEach(tracks, function(track) {
+            if (!insertTrackSync(userId, scorm.id, scoId, attempt, track.element, track.value,
+                                    scorm.forcecompleted, userData[scoId])) {
+                success = false;
+            }
+        });
+        return success;
+    };
+        function scormIsset(userdata, param, ifempty) {
+        if (typeof ifempty == 'undefined') {
+            ifempty = '';
+        }
+        if (typeof userdata[param] != 'undefined') {
+            return userdata[param];
+        }
+        return ifempty;
+    }
+    return self;
+}]);
+
+angular.module('mm.addons.mod_scorm')
+.factory('$mmaModScormOnline', ["$mmSite", "$q", "$mmWS", function($mmSite, $q, $mmWS) {
+    var self = {};
+        function getAttemptCountCacheKey(scormId, userId) {
+        userId = userId || $mmSite.getUserId();
+        return 'mmaModScorm:attemptcount:' + scormId + ':' + userId;
+    }
+        self.getAttemptCount = function(scormId, userId, ignoreMissing) {
+        userId = userId || $mmSite.getUserId();
+        var params = {
+                scormid: scormId,
+                userid: userId,
+                ignoremissingcompletion: ignoreMissing ? 1 : 0
+            },
+            preSets = {
+                cacheKey: getAttemptCountCacheKey(scormId, userId)
+            };
+        return $mmSite.read('mod_scorm_get_scorm_attempt_count', params, preSets).then(function(response) {
+            if (response && typeof response.attemptscount != 'undefined') {
+                return response.attemptscount;
+            }
+            return $q.reject();
+        });
+    };
+        function getScormUserDataCacheKey(scormId, attempt) {
+        return getScormUserDataCommonCacheKey(scormId) + ':' + attempt;
+    }
+        function getScormUserDataCommonCacheKey(scormId) {
+        return 'mmaModScorm:userdata:' + scormId;
+    }
+        self.getScormUserData = function(scormId, attempt) {
+        var params = {
+                scormid: scormId,
+                attempt: attempt
+            },
+            preSets = {
+                cacheKey: getScormUserDataCacheKey(scormId, attempt)
+            };
+        return $mmSite.read('mod_scorm_get_scorm_user_data', params, preSets).then(function(response) {
+            if (response && response.data) {
+                var data = {};
+                angular.forEach(response.data, function(sco) {
+                    var formattedDefaultData = {},
+                        formattedUserData = {};
+                    angular.forEach(sco.defaultdata, function(entry) {
+                        formattedDefaultData[entry.element] = entry.value;
+                    });
+                    angular.forEach(sco.userdata, function(entry) {
+                        formattedUserData[entry.element] = entry.value;
+                    });
+                    sco.defaultdata = formattedDefaultData;
+                    sco.userdata = formattedUserData;
+                    data[sco.scoid] = sco;
+                });
+                return data;
+            }
+            return $q.reject();
+        });
+    };
+        self.invalidateAttemptCount = function(scormId, userId) {
+        return $mmSite.invalidateWsCacheForKey(getAttemptCountCacheKey(scormId, userId));
+    };
+        self.invalidateScormUserData = function(scormId) {
+        return $mmSite.invalidateWsCacheForKeyStartingWith(getScormUserDataCommonCacheKey(scormId));
     };
         self.saveTracks = function(scoId, attempt, tracks) {
         var params = {
@@ -16798,6 +17337,34 @@ angular.module('mm.addons.notes')
 }]);
 
 angular.module('mm.addons.notifications')
+.directive('mmaNotificationsActions', ["$log", "$mmModuleActionsDelegate", "$state", function($log, $mmModuleActionsDelegate, $state) {
+    $log = $log.getInstance('mmaNotificationsActions');
+    function link(scope, element, attrs) {
+        if (scope.contexturl) {
+            scope.actions = $mmModuleActionsDelegate.getActionsFor(scope.contexturl, scope.courseid);
+        }
+    }
+    function controller($scope) {
+        $scope.jump = function(e, state, stateParams) {
+            e.stopPropagation();
+            e.preventDefault();
+            $state.go(state, stateParams);
+        };
+    }
+    controller.$inject = ["$scope"];
+    return {
+        controller: controller,
+        link: link,
+        restrict: 'E',
+        scope: {
+            contexturl: '=',
+            courseid: '='
+        },
+        templateUrl: 'addons/notifications/templates/actions.html',
+    };
+}]);
+
+angular.module('mm.addons.notifications')
 .controller('mmaNotificationsListCtrl', ["$scope", "$mmUtil", "$mmaNotifications", "mmaNotificationsListLimit", function($scope, $mmUtil, $mmaNotifications, mmaNotificationsListLimit) {
     var readCount = 0,
         unreadCount = 0;
@@ -16860,34 +17427,6 @@ angular.module('mm.addons.notifications')
         fetchNotifications().finally(function() {
             $scope.$broadcast('scroll.infiniteScrollComplete');
         });
-    };
-}]);
-
-angular.module('mm.addons.notifications')
-.directive('mmaNotificationsActions', ["$log", "$mmModuleActionsDelegate", "$state", function($log, $mmModuleActionsDelegate, $state) {
-    $log = $log.getInstance('mmaNotificationsActions');
-    function link(scope, element, attrs) {
-        if (scope.contexturl) {
-            scope.actions = $mmModuleActionsDelegate.getActionsFor(scope.contexturl, scope.courseid);
-        }
-    }
-    function controller($scope) {
-        $scope.jump = function(e, state, stateParams) {
-            e.stopPropagation();
-            e.preventDefault();
-            $state.go(state, stateParams);
-        };
-    }
-    controller.$inject = ["$scope"];
-    return {
-        controller: controller,
-        link: link,
-        restrict: 'E',
-        scope: {
-            contexturl: '=',
-            courseid: '='
-        },
-        templateUrl: 'addons/notifications/templates/actions.html',
     };
 }]);
 
